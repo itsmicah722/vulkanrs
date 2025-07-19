@@ -183,11 +183,17 @@ unsafe fn check_physical_device(
     let properties = unsafe { instance.get_physical_device_properties(physical_device) };
     let features = unsafe { instance.get_physical_device_features(physical_device) };
 
+<<<<<<< HEAD
     if properties.device_type != PhysicalDeviceType::DISCRETE_GPU
         && properties.device_type != PhysicalDeviceType::INTEGRATED_GPU
     {
         return Err(anyhow!(SuitabilityError(
             "Only discrete and integrated GPUs are supported."
+=======
+    if properties.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
+        return Err(anyhow!(SuitabilityError(
+            "Only discrete GPUs are supported."
+>>>>>>> 42e69707514848f4c4e606fa5fccbe46c4bd7614
         )));
     } else if features.geometry_shader != vk::TRUE {
         return Err(anyhow!(SuitabilityError(

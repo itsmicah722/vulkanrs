@@ -11,13 +11,11 @@ use std::{
     ffi::{c_void, CStr},
 };
 
-// Here we use `Result<T, anyhow::Error>` aka - `Result<()>` for easier error handling and
-// propagation, since anyhow wraps those types and can store any error that implements
-// `std::error`. Propagation can be done via "?", allowing us to avoid more matches or unwraps.
 use anyhow::{anyhow, Context, Result};
 use log::*;
+use thiserror::Error;
 use vulkanalia::{
-    loader::{LibloadingLoader, LIBRARY}, vk, vk::{EntryV1_0, ExtDebugUtilsExtension, HasBuilder, InstanceV1_0},
+    loader::{LibloadingLoader, LIBRARY}, vk, vk::{EntryV1_0, ExtDebugUtilsExtension, HasBuilder, InstanceV1_0, PhysicalDeviceType},
     window as vk_window,
     Entry,
     Instance,
@@ -87,6 +85,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// All Vulkan handles and associated properties used by `App`.
+#[derive(Clone, Debug, Default)]
+struct AppData {
+    messenger: vk::DebugUtilsMessengerEXT,
+    physical_device: vk::PhysicalDevice,
+}
+
 /// Main `App` which implements Vulkan boilerplate functionality.
 #[derive(Clone, Debug)]
 struct App {
@@ -102,17 +107,8 @@ impl App {
             let loader = LibloadingLoader::new(LIBRARY)?;
             let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
             let mut data = AppData::default();
-            let instance = match create_instance(window, &entry, &mut data) {
-                Ok(instance) => {
-                    trace!("Created Vulkan instance.");
-                    instance
-                }
-
-                Err(e) => {
-                    error!("Failed to create Vulkan instance: {:?}", e);
-                    return Err(e);
-                }
-            };
+            let instance = create_instance(window, &entry, &mut data)?;
+            pick_physical_device(&instance, &mut data)?;
 
             (entry, instance, data)
         };
@@ -144,10 +140,113 @@ impl App {
     }
 }
 
-/// All Vulkan handles and associated properties used by `App`.
-#[derive(Clone, Debug, Default)]
-struct AppData {
-    messenger: vk::DebugUtilsMessengerEXT,
+#[derive(Debug, Error)]
+#[error("Missing {0}.")]
+pub struct SuitabilityError(pub &'static str);
+
+#[derive(Copy, Clone, Debug)]
+struct QueueFamilyIndices {
+    graphics: u32,
+}
+
+impl QueueFamilyIndices {
+    unsafe fn get(
+        instance: &Instance,
+        data: &AppData,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<Self> {
+        let properties =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+        let graphics = properties
+            .iter()
+            .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .map(|i| i as u32);
+
+        match graphics {
+            Some(graphics) => {
+                trace!("Graphics queue family found and supported.");
+                Ok(Self { graphics })
+            }
+            None => Err(anyhow!(SuitabilityError(
+                "Missing required graphics queue families."
+            ))),
+        }
+    }
+}
+
+unsafe fn check_physical_device(
+    instance: &Instance,
+    data: &AppData,
+    physical_device: vk::PhysicalDevice,
+) -> Result<()> {
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let features = unsafe { instance.get_physical_device_features(physical_device) };
+
+    if properties.device_type != PhysicalDeviceType::DISCRETE_GPU
+        && properties.device_type != PhysicalDeviceType::INTEGRATED_GPU
+    {
+        return Err(anyhow!(SuitabilityError(
+            "Only discrete and integrated GPUs are supported."
+        )));
+    } else if features.geometry_shader != vk::TRUE {
+        return Err(anyhow!(SuitabilityError(
+            "Missing geometry shader support."
+        )));
+    } else {
+        trace!("========================");
+        trace!("|      GPU FOUND!      |");
+        trace!("========================");
+
+        trace!("NAME: {}", properties.device_name);
+        trace!("ID: {}", properties.device_id);
+        trace!("VULKAN API VERSION: {}", properties.api_version);
+        trace!("VENDOR ID: {}", properties.vendor_id);
+    }
+
+    unsafe { QueueFamilyIndices::get(instance, data, physical_device) }?;
+
+    Ok(())
+}
+
+fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> {
+    for physical_device in unsafe { instance.enumerate_physical_devices()? } {
+        let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+
+        match unsafe { check_physical_device(instance, data, physical_device) } {
+            Ok(_) => {
+                data.physical_device = physical_device;
+                return Ok(());
+            }
+            Err(_) => {
+                warn!("Skipping physical device (`{}`)", properties.device_name);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+extern "system" fn debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    type_: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _: *mut c_void,
+) -> vk::Bool32 {
+    let data = unsafe { *data };
+    let message = unsafe { CStr::from_ptr(data.message).to_string_lossy() };
+
+    if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::ERROR {
+        error!("({:?}) {}", type_, message);
+    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING {
+        warn!("({:?}) {}", type_, message);
+    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::INFO {
+        // debug!("({:?}) {}", type_, message);
+    } else {
+        // trace!("({:?}) {}", type_, message);
+    }
+
+    vk::FALSE
 }
 
 /// Create the Vulkan instance.
@@ -237,7 +336,19 @@ unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) ->
     }
 
     // Create the Vulkan instance.
-    let instance = unsafe { entry.create_instance(&create_info, None)? };
+    // let instance = unsafe { entry.create_instance(&create_info, None)? };
+    let instance = unsafe {
+        match entry.create_instance(&create_info, None) {
+            Ok(instance) => {
+                trace!("Created Vulkan instance.");
+                instance
+            }
+            Err(e) => {
+                error!("Failed to created Vulkan instance: {:?}", e);
+                return Err(e.into());
+            }
+        }
+    };
 
     // Create the Vulkan debug messenger.
     if VALIDATION_ENABLED {
@@ -246,44 +357,4 @@ unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) ->
     }
 
     Ok(instance)
-}
-
-/// The `Debug Callback` explicitly controls what messages the Vulkan validation layers will print
-/// to standard output.
-///
-/// # Parameters
-/// - `severity` contains bitmask flags for how severe a message was that triggered the
-/// validation layers (e.g. verbose, info, warning, error).
-/// - `type_` is a bitmask specifying which type of event triggered the callback (e.g. general,
-/// validation, performance)
-/// - `data` points to detailed information about the debug message being emitted (i.e. message,
-/// message ID, objects involved, etc.)
-/// - `_` contains the raw pointer provided when setting up the debug messenger, which is not used
-/// here.
-///
-/// # Return
-/// The callback returns a `vk::VkBook` *Vulkan* Boolean that indicates if the Vulkan call that
-/// triggered the validation layer should be aborted. If the callback returns true, then the
-/// call is aborted with an error code. This is only for testing the actual validation layers
-/// themselves, so we will **always** return `TRUE`.
-extern "system" fn debug_callback(
-    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    type_: vk::DebugUtilsMessageTypeFlagsEXT,
-    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _: *mut c_void,
-) -> vk::Bool32 {
-    let data = unsafe { *data };
-    let message = unsafe { CStr::from_ptr(data.message).to_string_lossy() };
-
-    if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::ERROR {
-        error!("({:?}) {}", type_, message);
-    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING {
-        warn!("({:?}) {}", type_, message);
-    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::INFO {
-        // debug!("({:?}) {}", type_, message);
-    } else {
-        // trace!("({:?}) {}", type_, message);
-    }
-
-    vk::FALSE
 }

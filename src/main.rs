@@ -1,3 +1,5 @@
+//! Vulkan Application with the goal to render a triangle.
+
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(
     dead_code,
@@ -8,18 +10,20 @@
 
 use std::{
     collections::HashSet,
-    ffi::{c_void, CStr},
+    ffi::{CStr, c_void},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::*;
 use thiserror::Error;
 use vulkanalia::{
-    loader::{LibloadingLoader, LIBRARY}, vk, vk::{EntryV1_0, ExtDebugUtilsExtension, HasBuilder, InstanceV1_0, PhysicalDeviceType},
+    Device, Entry, Instance, Version,
+    loader::{LIBRARY, LibloadingLoader},
+    vk,
+    vk::{
+        DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, HasBuilder, InstanceV1_0, PhysicalDeviceType,
+    },
     window as vk_window,
-    Entry,
-    Instance,
-    Version,
 };
 use winit::{
     dpi::LogicalSize,
@@ -90,6 +94,7 @@ fn main() -> Result<()> {
 struct AppData {
     messenger: vk::DebugUtilsMessengerEXT,
     physical_device: vk::PhysicalDevice,
+    graphics_queue: vk::Queue,
 }
 
 /// Main `App` which implements Vulkan boilerplate functionality.
@@ -97,25 +102,28 @@ struct AppData {
 struct App {
     entry: Entry,
     instance: Instance,
+    device: Device,
     data: AppData,
 }
 
 impl App {
     /// Initializes Vulkan resources tied to App.
     unsafe fn create(window: &Window) -> Result<Self> {
-        let (entry, instance, data) = unsafe {
+        let (entry, instance, data, device) = unsafe {
             let loader = LibloadingLoader::new(LIBRARY)?;
             let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
             let mut data = AppData::default();
             let instance = create_instance(window, &entry, &mut data)?;
             pick_physical_device(&instance, &mut data)?;
+            let device = create_logical_device(&entry, &instance, &mut data)?;
 
-            (entry, instance, data)
+            (entry, instance, data, device)
         };
 
         Ok(Self {
             entry,
             instance,
+            device,
             data,
         })
     }
@@ -128,6 +136,8 @@ impl App {
     /// Destroys Vulkan resources tied to App.
     unsafe fn destroy(&mut self) {
         unsafe {
+            self.device.destroy_device(None);
+
             if VALIDATION_ENABLED {
                 self.instance
                     .destroy_debug_utils_messenger_ext(self.data.messenger, None);
@@ -140,16 +150,89 @@ impl App {
     }
 }
 
+unsafe fn create_logical_device(
+    entry: &Entry,
+    instance: &Instance,
+    data: &mut AppData,
+) -> Result<Device> {
+    let indices = unsafe { QueueFamilyIndices::get(instance, data, data.physical_device)? };
+
+    // Set the queue priority to highest and provide the queue create info with the family index
+    // and priority float.
+    let queue_priorities = &[1.0];
+    let queue_info = vk::DeviceQueueCreateInfo::builder()
+        .queue_family_index(indices.graphics)
+        .queue_priorities(queue_priorities);
+
+    // Give the device level layer validation layer support (for compatibility of older
+    // vulkan implementations).
+    let layers = if VALIDATION_ENABLED {
+        vec![VALIDATION_LAYER.as_ptr()]
+    } else {
+        vec![]
+    };
+
+    // Give the device level extensions portability support if the host is running macOS.
+    let mut extensions = vec![];
+    if cfg!(target_os = "macos") && entry.version()? >= PORTABILITY_MACOS_VERSION {
+        extensions.push(vk::KHR_PORTABILITY_SUBSET_EXTENSION.name.as_ptr());
+    }
+
+    // Get the physical device's supported features.
+    let features = vk::PhysicalDeviceFeatures::builder();
+
+    // A single logical device can be created with multiple queues from different queue families,
+    // each with their own capabilities and priority. (in this case we only are using graphics
+    // queue)
+    let queue_infos = &[queue_info];
+
+    // Setup logical device create info with all queue info structs, layers, extensions, and
+    // features.
+    let device_info = vk::DeviceCreateInfo::builder()
+        .queue_create_infos(queue_infos)
+        .enabled_layer_names(&layers)
+        .enabled_extension_names(&extensions)
+        .enabled_features(&features);
+
+    // Create the Vulkan logical device.
+    // let device = unsafe { instance.create_device(data.physical_device, &device_info, None)? };
+
+    let device = unsafe {
+        match instance.create_device(data.physical_device, &device_info, None) {
+            Ok(device) => {
+                trace!("Created Vulkan logical device.");
+                device
+            }
+
+            Err(e) => {
+                error!("Failed to create Vulkan logical device.");
+                return Err(e.into());
+            }
+        }
+    };
+
+    // Set the graphics queue to the graphics family index.
+    data.graphics_queue = unsafe { device.get_device_queue(indices.graphics, 0) };
+
+    Ok(device)
+}
+
 #[derive(Debug, Error)]
 #[error("Missing {0}.")]
 pub struct SuitabilityError(pub &'static str);
 
+/// A family queue contains different operations available on a physical device, (e.g. graphics,
+/// compute, transfer). These 'families' are identified by their index, starting from 0. The
+/// most important queue is the graphics queue, as this gives us the capability to render.
 #[derive(Copy, Clone, Debug)]
 struct QueueFamilyIndices {
     graphics: u32,
 }
 
 impl QueueFamilyIndices {
+    /// Get the index of the queue family which supports the "graphics" operation and
+    /// return it as an u32. If no family is found with graphics support, the function returns
+    /// with an error, otherwise the u32 index is returned (usually 0).
     unsafe fn get(
         instance: &Instance,
         data: &AppData,
@@ -158,6 +241,8 @@ impl QueueFamilyIndices {
         let properties =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
+        // Iterate through the physical device queue family properties for the graphics queue flags.
+        // If the graphics flag exists, convert it to u32 (index).
         let graphics = properties
             .iter()
             .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
@@ -165,7 +250,6 @@ impl QueueFamilyIndices {
 
         match graphics {
             Some(graphics) => {
-                trace!("Graphics queue family found and supported.");
                 Ok(Self { graphics })
             }
             None => Err(anyhow!(SuitabilityError(
@@ -175,6 +259,9 @@ impl QueueFamilyIndices {
     }
 }
 
+/// Check whether the Vulkan physical device (GPU) contains a geometry shader feature, and make
+/// sure the GPU is either integrated or discrete. If any of these are not detected, we return
+/// with an error.
 unsafe fn check_physical_device(
     instance: &Instance,
     data: &AppData,
@@ -194,14 +281,10 @@ unsafe fn check_physical_device(
             "Missing geometry shader support."
         )));
     } else {
-        trace!("========================");
-        trace!("|      GPU FOUND!      |");
-        trace!("========================");
-
-        trace!("NAME: {}", properties.device_name);
-        trace!("ID: {}", properties.device_id);
-        trace!("VULKAN API VERSION: {}", properties.api_version);
-        trace!("VENDOR ID: {}", properties.vendor_id);
+        trace!("================================");
+        trace!("|         GPU FOUND!           |");
+        trace!("================================");
+        trace!("{}", properties.device_name);
     }
 
     unsafe { QueueFamilyIndices::get(instance, data, physical_device) }?;
@@ -209,6 +292,7 @@ unsafe fn check_physical_device(
     Ok(())
 }
 
+/// Select a suitable Vulkan physical device (GPU) based on its properties and features.
 fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> {
     for physical_device in unsafe { instance.enumerate_physical_devices()? } {
         let properties = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -227,6 +311,8 @@ fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> {
     Ok(())
 }
 
+/// Vulkan debug callback for explicit control over what the validation layers will print to
+/// standard output.
 extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     type_: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -240,10 +326,6 @@ extern "system" fn debug_callback(
         error!("({:?}) {}", type_, message);
     } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING {
         warn!("({:?}) {}", type_, message);
-    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::INFO {
-        // debug!("({:?}) {}", type_, message);
-    } else {
-        // trace!("({:?}) {}", type_, message);
     }
 
     vk::FALSE

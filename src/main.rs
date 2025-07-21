@@ -1,6 +1,4 @@
 //! Vulkan Application with the goal to render a triangle.
-
-#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(
     dead_code,
     unused_variables,
@@ -10,20 +8,21 @@
 
 use std::{
     collections::HashSet,
-    ffi::{CStr, c_void},
+    ffi::{c_void, CStr},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use log::*;
 use thiserror::Error;
 use vulkanalia::{
-    Device, Entry, Instance, Version,
-    loader::{LIBRARY, LibloadingLoader},
-    vk,
-    vk::{
-        DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, HasBuilder, InstanceV1_0, PhysicalDeviceType,
-    },
-    window as vk_window,
+    loader::{LibloadingLoader, LIBRARY}, vk, vk::{
+        DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, HasBuilder, InstanceV1_0,
+        KhrSurfaceExtension, PhysicalDeviceType, SurfaceKHR,
+    }, window as vk_window,
+    Device,
+    Entry,
+    Instance,
+    Version,
 };
 use winit::{
     dpi::LogicalSize,
@@ -32,10 +31,19 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
+/// Whether Vulkan validation layers should be enabled or not.
 const VALIDATION_ENABLED: bool = cfg!(debug_assertions);
+
+/// The Vulkan validation layer name as a safe CString.
 const VALIDATION_LAYER: vk::ExtensionName =
     vk::ExtensionName::from_bytes(c"VK_LAYER_KHRONOS_validation".to_bytes_with_nul());
+
+/// The Vulkan SDK version that started requiring the portability subset extension for macOS.
+const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
+
+/// The Vulkan physical device level extensions. Here, we list the "VK_KHR_swapchain" extension,
+/// later useful for checking if the GPU has swap chain support.
+const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
 
 fn main() -> Result<()> {
     unsafe {
@@ -89,12 +97,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// All Vulkan handles and associated properties used by `App`.
+/// Intermediate Vulkan handles which get bundled into `App`.
 #[derive(Clone, Debug, Default)]
 struct AppData {
     messenger: vk::DebugUtilsMessengerEXT,
+    surface: SurfaceKHR,
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
+    present_queue: vk::Queue,
 }
 
 /// Main `App` which implements Vulkan boilerplate functionality.
@@ -114,6 +124,7 @@ impl App {
             let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
             let mut data = AppData::default();
             let instance = create_instance(window, &entry, &mut data)?;
+            data.surface = create_surface(&instance, &window)?;
             pick_physical_device(&instance, &mut data)?;
             let device = create_logical_device(&entry, &instance, &mut data)?;
 
@@ -137,6 +148,10 @@ impl App {
     unsafe fn destroy(&mut self) {
         unsafe {
             self.device.destroy_device(None);
+            trace!("Destroyed Vulkan logical device.");
+
+            self.instance.destroy_surface_khr(self.data.surface, None);
+            trace!("Destroyed Vulkan surface KHR");
 
             if VALIDATION_ENABLED {
                 self.instance
@@ -150,6 +165,35 @@ impl App {
     }
 }
 
+/// The Vulkan `Surface` is simply an *abstraction* of the native windowing or display target you
+/// want to present images to. It serves as the "glue" between Vulkan's generic presentation API
+/// and whatever the OS's underlying window-library actually provides.
+///
+/// Vulkan by itself doesn't know about windows or screens due to its platform-agnostic nature.
+/// It relies on `WSI` (window system integration) KHR extensions to tell it where to show
+/// rendered images to, which is essentially what the surface does.
+unsafe fn create_surface(instance: &Instance, window: &Window) -> Result<SurfaceKHR> {
+    let surface_raw = unsafe { vk_window::create_surface(instance, window, window) };
+
+    let surface = surface_raw.map_err(|e| {
+        error!("Failed to create Vulkan KHR surface: {}", e);
+        e
+    })?;
+
+    trace!("Created Vulkan KHR surface.");
+
+    Ok(surface)
+}
+
+/// The Vulkan physical device is just a description of the **GPU**. The Vulkan physical device
+/// never talks to the GPU directly. The `Logical Device` is simply a handle to that physical device
+/// to do all the *real* work. The logical device is a configured interface to the GPU and allows us
+/// to allocate memory or submit any work to Vulkan queues.
+///
+/// Multiple logical devices can be created from one physical device if we wanted different
+/// *contexts* with different enabled features or queue priorities. Also, multiple physical
+/// devices can be created if there are multiple GPUs detected, each with their own logical device
+/// for a multi-GPU setup.
 unsafe fn create_logical_device(
     entry: &Entry,
     instance: &Instance,
@@ -157,12 +201,25 @@ unsafe fn create_logical_device(
 ) -> Result<Device> {
     let indices = unsafe { QueueFamilyIndices::get(instance, data, data.physical_device)? };
 
+    let mut unique_indices = HashSet::new();
+    unique_indices.insert(indices.graphics);
+    unique_indices.insert(indices.present);
+
     // Set the queue priority to highest and provide the queue create info with the family index
     // and priority float.
     let queue_priorities = &[1.0];
-    let queue_info = vk::DeviceQueueCreateInfo::builder()
-        .queue_family_index(indices.graphics)
-        .queue_priorities(queue_priorities);
+
+    // A single logical device can be created with multiple queues from different queue families,
+    // each with their own capabilities and priority. (in this case we only are using graphics
+    // queue)
+    let queue_infos = unique_indices
+        .iter()
+        .map(|i| {
+            vk::DeviceQueueCreateInfo::builder()
+                .queue_family_index(*i)
+                .queue_priorities(queue_priorities)
+        })
+        .collect::<Vec<_>>();
 
     // Give the device level layer validation layer support (for compatibility of older
     // vulkan implementations).
@@ -171,6 +228,11 @@ unsafe fn create_logical_device(
     } else {
         vec![]
     };
+
+    let mut extensions = DEVICE_EXTENSIONS
+        .iter()
+        .map(|n| n.as_ptr())
+        .collect::<Vec<_>>();
 
     // Give the device level extensions portability support if the host is running macOS.
     let mut extensions = vec![];
@@ -181,15 +243,10 @@ unsafe fn create_logical_device(
     // Get the physical device's supported features.
     let features = vk::PhysicalDeviceFeatures::builder();
 
-    // A single logical device can be created with multiple queues from different queue families,
-    // each with their own capabilities and priority. (in this case we only are using graphics
-    // queue)
-    let queue_infos = &[queue_info];
-
     // Setup logical device create info with all queue info structs, layers, extensions, and
     // features.
     let device_info = vk::DeviceCreateInfo::builder()
-        .queue_create_infos(queue_infos)
+        .queue_create_infos(&queue_infos)
         .enabled_layer_names(&layers)
         .enabled_extension_names(&extensions)
         .enabled_features(&features);
@@ -213,6 +270,7 @@ unsafe fn create_logical_device(
 
     // Set the graphics queue to the graphics family index.
     data.graphics_queue = unsafe { device.get_device_queue(indices.graphics, 0) };
+    data.present_queue = unsafe { device.get_device_queue(indices.present, 0) };
 
     Ok(device)
 }
@@ -227,6 +285,7 @@ pub struct SuitabilityError(pub &'static str);
 #[derive(Copy, Clone, Debug)]
 struct QueueFamilyIndices {
     graphics: u32,
+    present: u32,
 }
 
 impl QueueFamilyIndices {
@@ -248,18 +307,33 @@ impl QueueFamilyIndices {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
             .map(|i| i as u32);
 
-        match graphics {
-            Some(graphics) => {
-                Ok(Self { graphics })
+        let mut present = None;
+        for (index, properties) in properties.iter().enumerate() {
+            let present_support = unsafe {
+                instance.get_physical_device_surface_support_khr(
+                    physical_device,
+                    index as u32,
+                    data.surface,
+                )?
+            };
+
+            if present_support {
+                present = Some(index as u32);
+                break;
             }
-            None => Err(anyhow!(SuitabilityError(
-                "Missing required graphics queue families."
-            ))),
+        }
+
+        if let (Some(graphics), Some(present)) = (graphics, present) {
+            Ok(Self { graphics, present })
+        } else {
+            Err(anyhow!(SuitabilityError(
+                "Missing required queue families."
+            )))
         }
     }
 }
 
-/// Check whether the Vulkan physical device (GPU) contains a geometry shader feature, and make
+/// Check whether the Vulkan physical device contains a geometry shader feature, and make
 /// sure the GPU is either integrated or discrete. If any of these are not detected, we return
 /// with an error.
 unsafe fn check_physical_device(
@@ -281,15 +355,33 @@ unsafe fn check_physical_device(
             "Missing geometry shader support."
         )));
     } else {
-        trace!("================================");
-        trace!("|         GPU FOUND!           |");
-        trace!("================================");
-        trace!("{}", properties.device_name);
+        trace!("Found physical device: {}", properties.device_name);
     }
 
     unsafe { QueueFamilyIndices::get(instance, data, physical_device) }?;
+    unsafe { check_physical_device_extensions(instance, physical_device)? };
 
     Ok(())
+}
+
+/// Ensure the physical device supports the required swap chain extension.
+unsafe fn check_physical_device_extensions(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<()> {
+    let extensions = instance
+        .enumerate_device_extension_properties(physical_device, None)?
+        .iter()
+        .map(|ext| ext.extension_name)
+        .collect::<HashSet<_>>();
+
+    if DEVICE_EXTENSIONS.iter().all(|e| extensions.contains(e)) {
+        Ok(())
+    } else {
+        Err(anyhow!(SuitabilityError(
+            "Missing required device extensions."
+        )))
+    }
 }
 
 /// Select a suitable Vulkan physical device (GPU) based on its properties and features.

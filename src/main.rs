@@ -2,27 +2,28 @@
 #![allow(
     dead_code,
     unused_variables,
+    unsafe_op_in_unsafe_fn,
     clippy::too_many_arguments,
     clippy::unnecessary_wraps
 )]
 
 use std::{
     collections::HashSet,
-    ffi::{c_void, CStr},
+    ffi::{CStr, c_void},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::*;
 use thiserror::Error;
 use vulkanalia::{
-    loader::{LibloadingLoader, LIBRARY}, vk, vk::{
-        DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, HasBuilder, InstanceV1_0,
-        KhrSurfaceExtension, PhysicalDeviceType, SurfaceKHR,
-    }, window as vk_window,
-    Device,
-    Entry,
-    Instance,
-    Version,
+    Device, Entry, Instance, Version,
+    loader::{LIBRARY, LibloadingLoader},
+    vk,
+    vk::{
+        DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, Handle, HasBuilder, InstanceV1_0,
+        KhrSurfaceExtension, KhrSwapchainExtension, PhysicalDeviceType, SurfaceKHR,
+    },
+    window as vk_window,
 };
 use winit::{
     dpi::LogicalSize,
@@ -105,6 +106,10 @@ struct AppData {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    swapchain_format: vk::Format,
+    swapchain_extent: vk::Extent2D,
+    swapchain: vk::SwapchainKHR,
+    swapchain_images: Vec<vk::Image>,
 }
 
 /// Main `App` which implements Vulkan boilerplate functionality.
@@ -127,6 +132,7 @@ impl App {
             data.surface = create_surface(&instance, &window)?;
             pick_physical_device(&instance, &mut data)?;
             let device = create_logical_device(&entry, &instance, &mut data)?;
+            create_swapchain(window, &instance, &device, &mut data)?;
 
             (entry, instance, data, device)
         };
@@ -147,11 +153,14 @@ impl App {
     /// Destroys Vulkan resources tied to App.
     unsafe fn destroy(&mut self) {
         unsafe {
+            self.device.destroy_swapchain_khr(self.data.swapchain, None);
+            trace!("Destroyed Vulkan swapchain.");
+
             self.device.destroy_device(None);
             trace!("Destroyed Vulkan logical device.");
 
             self.instance.destroy_surface_khr(self.data.surface, None);
-            trace!("Destroyed Vulkan surface KHR");
+            trace!("Destroyed Vulkan surface.");
 
             if VALIDATION_ENABLED {
                 self.instance
@@ -164,6 +173,147 @@ impl App {
         }
     }
 }
+
+// ---------------------------------------------
+// Structs
+// ---------------------------------------------
+
+#[derive(Clone, Debug)]
+struct SwapchainSupport {
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    present_modes: Vec<vk::PresentModeKHR>,
+}
+
+#[derive(Debug, Error)]
+#[error("Missing {0}.")]
+pub struct SuitabilityError(pub &'static str);
+
+/// A family queue contains different operations available on a physical device, (e.g. graphics,
+/// compute, transfer). These 'families' are identified by their index, starting from 0. The
+/// most important queue is the graphics queue, as this gives us the capability to render.
+#[derive(Copy, Clone, Debug)]
+struct QueueFamilyIndices {
+    graphics: u32,
+    present: u32,
+}
+
+// ---------------------------------------------
+// Swap Chain
+// ---------------------------------------------
+
+impl SwapchainSupport {
+    unsafe fn get(
+        instance: &Instance,
+        data: &AppData,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<Self> {
+        Ok(Self {
+            capabilities: instance
+                .get_physical_device_surface_capabilities_khr(physical_device, data.surface)?,
+            formats: instance
+                .get_physical_device_surface_formats_khr(physical_device, data.surface)?,
+            present_modes: instance
+                .get_physical_device_surface_present_modes_khr(physical_device, data.surface)?,
+        })
+    }
+}
+
+unsafe fn create_swapchain(
+    window: &Window,
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
+    let support = SwapchainSupport::get(instance, data, data.physical_device)?;
+
+    let surface_format = get_swapchain_surface_format(&support.formats);
+    let present_mode = get_swapchain_present_mode(&support.present_modes);
+    let extent = get_swapchain_extent(window, support.capabilities);
+
+    let mut image_count = support.capabilities.min_image_count + 1;
+    // `0` here is a special value that means there is no maximum
+    if support.capabilities.max_image_count != 0
+        && image_count > support.capabilities.max_image_count
+    {
+        image_count = support.capabilities.max_image_count;
+    }
+
+    let mut queue_family_indices = vec![];
+    let image_sharing_mode = if indices.graphics != indices.present {
+        queue_family_indices.push(indices.graphics);
+        queue_family_indices.push(indices.present);
+        vk::SharingMode::CONCURRENT
+    } else {
+        vk::SharingMode::EXCLUSIVE
+    };
+
+    let info = vk::SwapchainCreateInfoKHR::builder()
+        .surface(data.surface)
+        .min_image_count(image_count)
+        .image_format(surface_format.format)
+        .image_color_space(surface_format.color_space)
+        .image_extent(extent)
+        .image_array_layers(1)
+        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        .image_sharing_mode(image_sharing_mode)
+        .queue_family_indices(&queue_family_indices)
+        .pre_transform(support.capabilities.current_transform)
+        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+        .present_mode(present_mode)
+        .clipped(true)
+        .old_swapchain(vk::SwapchainKHR::null());
+
+    data.swapchain = device.create_swapchain_khr(&info, None)?;
+    trace!("Created Vulkan swapchain.");
+
+    data.swapchain_images = device.get_swapchain_images_khr(data.swapchain)?;
+    data.swapchain_format = surface_format.format;
+    data.swapchain_extent = extent;
+
+    Ok(())
+}
+
+fn get_swapchain_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+    formats
+        .iter()
+        .cloned()
+        .find(|f| {
+            f.format == vk::Format::B8G8R8A8_SRGB
+                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        })
+        .unwrap_or_else(|| formats[0])
+}
+
+fn get_swapchain_present_mode(present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    present_modes
+        .iter()
+        .cloned()
+        .find(|m| *m == vk::PresentModeKHR::MAILBOX)
+        .unwrap_or(vk::PresentModeKHR::FIFO)
+}
+
+fn get_swapchain_extent(window: &Window, capabilities: vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
+    if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        vk::Extent2D::builder()
+            .width(window.inner_size().width.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ))
+            .height(window.inner_size().height.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ))
+            .build()
+    }
+}
+
+// ---------------------------------------------
+// Window Surface
+// ---------------------------------------------
 
 /// The Vulkan `Surface` is simply an *abstraction* of the native windowing or display target you
 /// want to present images to. It serves as the "glue" between Vulkan's generic presentation API
@@ -184,6 +334,10 @@ unsafe fn create_surface(instance: &Instance, window: &Window) -> Result<Surface
 
     Ok(surface)
 }
+
+// ---------------------------------------------
+// Logical Device
+// ---------------------------------------------
 
 /// The Vulkan physical device is just a description of the **GPU**. The Vulkan physical device
 /// never talks to the GPU directly. The `Logical Device` is simply a handle to that physical device
@@ -229,13 +383,13 @@ unsafe fn create_logical_device(
         vec![]
     };
 
+    // Device-level extension for the swapchain KHR functionality.
     let mut extensions = DEVICE_EXTENSIONS
         .iter()
         .map(|n| n.as_ptr())
         .collect::<Vec<_>>();
 
     // Give the device level extensions portability support if the host is running macOS.
-    let mut extensions = vec![];
     if cfg!(target_os = "macos") && entry.version()? >= PORTABILITY_MACOS_VERSION {
         extensions.push(vk::KHR_PORTABILITY_SUBSET_EXTENSION.name.as_ptr());
     }
@@ -252,7 +406,6 @@ unsafe fn create_logical_device(
         .enabled_features(&features);
 
     // Create the Vulkan logical device.
-    // let device = unsafe { instance.create_device(data.physical_device, &device_info, None)? };
 
     let device = unsafe {
         match instance.create_device(data.physical_device, &device_info, None) {
@@ -275,18 +428,9 @@ unsafe fn create_logical_device(
     Ok(device)
 }
 
-#[derive(Debug, Error)]
-#[error("Missing {0}.")]
-pub struct SuitabilityError(pub &'static str);
-
-/// A family queue contains different operations available on a physical device, (e.g. graphics,
-/// compute, transfer). These 'families' are identified by their index, starting from 0. The
-/// most important queue is the graphics queue, as this gives us the capability to render.
-#[derive(Copy, Clone, Debug)]
-struct QueueFamilyIndices {
-    graphics: u32,
-    present: u32,
-}
+// ---------------------------------------------
+// Queue Families
+// ---------------------------------------------
 
 impl QueueFamilyIndices {
     /// Get the index of the queue family which supports the "graphics" operation and
@@ -333,6 +477,10 @@ impl QueueFamilyIndices {
     }
 }
 
+// ---------------------------------------------
+// Physical Device
+// ---------------------------------------------
+
 /// Check whether the Vulkan physical device contains a geometry shader feature, and make
 /// sure the GPU is either integrated or discrete. If any of these are not detected, we return
 /// with an error.
@@ -360,6 +508,11 @@ unsafe fn check_physical_device(
 
     unsafe { QueueFamilyIndices::get(instance, data, physical_device) }?;
     unsafe { check_physical_device_extensions(instance, physical_device)? };
+
+    let support = SwapchainSupport::get(instance, data, physical_device)?;
+    if support.formats.is_empty() || support.present_modes.is_empty() {
+        return Err(anyhow!(SuitabilityError("Insufficient swapchain support.")));
+    }
 
     Ok(())
 }
@@ -403,6 +556,10 @@ fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------
+// Debug Messenger
+// ---------------------------------------------
+
 /// Vulkan debug callback for explicit control over what the validation layers will print to
 /// standard output.
 extern "system" fn debug_callback(
@@ -422,6 +579,10 @@ extern "system" fn debug_callback(
 
     vk::FALSE
 }
+
+// ---------------------------------------------
+// Instance
+// ---------------------------------------------
 
 /// Create the Vulkan instance.
 unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) -> Result<Instance> {

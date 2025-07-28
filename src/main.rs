@@ -9,21 +9,21 @@
 
 use std::{
     collections::HashSet,
-    ffi::{CStr, c_void},
+    ffi::{c_void, CStr},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use log::*;
 use thiserror::Error;
 use vulkanalia::{
-    Device, Entry, Instance, Version,
-    loader::{LIBRARY, LibloadingLoader},
-    vk,
-    vk::{
+    loader::{LibloadingLoader, LIBRARY}, vk, vk::{
         DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, Handle, HasBuilder, InstanceV1_0,
         KhrSurfaceExtension, KhrSwapchainExtension, PhysicalDeviceType, SurfaceKHR,
-    },
-    window as vk_window,
+    }, window as vk_window,
+    Device,
+    Entry,
+    Instance,
+    Version,
 };
 use winit::{
     dpi::LogicalSize,
@@ -31,6 +31,10 @@ use winit::{
     event_loop::EventLoop,
     window::{Window, WindowBuilder},
 };
+
+// ---------------------------------------------
+// Global Constants
+// ---------------------------------------------
 
 /// Whether Vulkan validation layers should be enabled or not.
 const VALIDATION_ENABLED: bool = cfg!(debug_assertions);
@@ -45,6 +49,10 @@ const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 /// The Vulkan physical device level extensions. Here, we list the "VK_KHR_swapchain" extension,
 /// later useful for checking if the GPU has swap chain support.
 const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
+
+// ---------------------------------------------
+// Entrypoint
+// ---------------------------------------------
 
 fn main() -> Result<()> {
     unsafe {
@@ -98,6 +106,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------
+// Structs
+// ---------------------------------------------
+
 /// Intermediate Vulkan handles which get bundled into `App`.
 #[derive(Clone, Debug, Default)]
 struct AppData {
@@ -110,6 +122,7 @@ struct AppData {
     swapchain_extent: vk::Extent2D,
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 
 /// Main `App` which implements Vulkan boilerplate functionality.
@@ -120,6 +133,32 @@ struct App {
     device: Device,
     data: AppData,
 }
+
+/// Obtains information about Vulkan swapchain availability.
+#[derive(Clone, Debug)]
+struct SwapchainSupport {
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    present_modes: Vec<vk::PresentModeKHR>,
+}
+
+/// A family queue contains different operations available on a physical device, (e.g. graphics,
+/// compute, transfer). These 'families' are identified by their index, starting from 0. The
+/// most important queue is the graphics queue, as this gives us the capability to render.
+#[derive(Copy, Clone, Debug)]
+struct QueueFamilyIndices {
+    graphics: u32,
+    present: u32,
+}
+
+/// Custom error handling for checking suitability of Vulkan components.
+#[derive(Debug, Error)]
+#[error("Missing {0}.")]
+pub struct SuitabilityError(pub &'static str);
+
+// ---------------------------------------------
+// Vulkan Application
+// ---------------------------------------------
 
 impl App {
     /// Initializes Vulkan resources tied to App.
@@ -133,6 +172,7 @@ impl App {
             pick_physical_device(&instance, &mut data)?;
             let device = create_logical_device(&entry, &instance, &mut data)?;
             create_swapchain(window, &instance, &device, &mut data)?;
+            create_swapchain_image_views(&device, &mut data)?;
 
             (entry, instance, data, device)
         };
@@ -153,6 +193,10 @@ impl App {
     /// Destroys Vulkan resources tied to App.
     unsafe fn destroy(&mut self) {
         unsafe {
+            self.data.swapchain_image_views.iter().for_each(|v| {
+                self.device.destroy_image_view(*v, None);
+            });
+
             self.device.destroy_swapchain_khr(self.data.swapchain, None);
             trace!("Destroyed Vulkan swapchain.");
 
@@ -175,34 +219,23 @@ impl App {
 }
 
 // ---------------------------------------------
-// Structs
+// Swapchain
 // ---------------------------------------------
 
-#[derive(Clone, Debug)]
-struct SwapchainSupport {
-    capabilities: vk::SurfaceCapabilitiesKHR,
-    formats: Vec<vk::SurfaceFormatKHR>,
-    present_modes: Vec<vk::PresentModeKHR>,
-}
-
-#[derive(Debug, Error)]
-#[error("Missing {0}.")]
-pub struct SuitabilityError(pub &'static str);
-
-/// A family queue contains different operations available on a physical device, (e.g. graphics,
-/// compute, transfer). These 'families' are identified by their index, starting from 0. The
-/// most important queue is the graphics queue, as this gives us the capability to render.
-#[derive(Copy, Clone, Debug)]
-struct QueueFamilyIndices {
-    graphics: u32,
-    present: u32,
-}
-
-// ---------------------------------------------
-// Swap Chain
-// ---------------------------------------------
+/// In Vulkan, the `Swapchain` is essentially a queue of images waiting be presented to the screen.
+/// The conditions of how the queue works and how images are presented/synchronized can be
+/// configured explicitly, but the general purpose remains the same.
+///
+/// The swapchain works with the GPU obtaining an image from the queue, rendering
+/// to it, and returning it back to the queue to be presented. The swapchain uses synchronization to
+/// ensure that an image was fully rendered to before presenting to the screen.
+///
+/// Because Vulkan is platform and hardware agnostic, presentation is handled
+/// via an extension rather than a default framebuffer, which must be obtained. This extension is
+/// not guaranteed to be available, although most modern GPUs support swap chain functionality.
 
 impl SwapchainSupport {
+    /// Gets Vulkan swapchain capabilities, surface formats, and presentation modes.
     unsafe fn get(
         instance: &Instance,
         data: &AppData,
@@ -309,6 +342,38 @@ fn get_swapchain_extent(window: &Window, capabilities: vk::SurfaceCapabilitiesKH
             ))
             .build()
     }
+}
+
+unsafe fn create_swapchain_image_views(device: &Device, data: &mut AppData) -> Result<()> {
+    data.swapchain_image_views = data
+        .swapchain_images
+        .iter()
+        .map(|i| {
+            let components = vk::ComponentMapping::builder()
+                .r(vk::ComponentSwizzle::IDENTITY)
+                .g(vk::ComponentSwizzle::IDENTITY)
+                .b(vk::ComponentSwizzle::IDENTITY)
+                .a(vk::ComponentSwizzle::IDENTITY);
+
+            let subresource_range = vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            let info = vk::ImageViewCreateInfo::builder()
+                .image(*i)
+                .view_type(vk::ImageViewType::_2D)
+                .format(data.swapchain_format)
+                .components(components)
+                .subresource_range(subresource_range);
+
+            device.create_image_view(&info, None)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(())
 }
 
 // ---------------------------------------------

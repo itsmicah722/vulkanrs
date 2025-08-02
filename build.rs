@@ -24,7 +24,7 @@ fn compile_shaders() -> Result<(), Box<dyn Error>> {
         let include_path = Path::new("shaders").join(requested);
 
         let content = fs::read_to_string(&include_path)
-            .map_err(|e| format!("Could not include '{}': {}", requested, e))?;
+            .map_err(|e| format!("Could not include '{requested}': {e}"))?;
 
         Ok(ResolvedInclude {
             // name must be non‐empty and unique (absolute path is typical)
@@ -43,7 +43,7 @@ fn compile_shaders() -> Result<(), Box<dyn Error>> {
 
     // Where to place compiled SPIR-V binaries
     let out_dir = env::var("OUT_DIR")?;
-    println!("cargo:rustc-env=SHADER_OUT_DIR={}", out_dir);
+    println!("cargo:rustc-env=SHADER_OUT_DIR={out_dir}");
 
     // Tell Cargo to re-run this script if anything in `shaders/` changes (add, remove, or modify)
     println!("cargo:rerun-if-changed=shaders");
@@ -75,15 +75,14 @@ fn compile_shaders() -> Result<(), Box<dyn Error>> {
             ShaderKind::TessEvaluation
         } else {
             panic!(
-                "Unrecognized shader type for file '{}'. Use a suffix like .vert.glsl or .frag\
-                .glsl",
-                filename
+                "Unrecognized shader type for file '{filename}'. Use a suffix like .vert.glsl or .frag\
+                .glsl"
             );
         };
 
         // Read the GLSL source code.
         let source = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to read shader '{}': {}", filename, e));
+            .unwrap_or_else(|e| panic!("Failed to read shader '{filename}': {e}"));
 
         // Compile GLSL text to SPIR-V binary.
         let artifact =

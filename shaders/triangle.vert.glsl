@@ -14,9 +14,9 @@ vec2 positions[3] = vec2[](
 
 // Contians the RGB colors for each vertex
 vec3 colors[3] = vec3[](
-    vec3(1.0, 0.0, 0.0),    // Blue
-    vec3(0.0, 1.0, 0.0),    // Green
-    vec3(0.0, 0.0, 1.0)     // Red
+    vec3(0.1, 0.4, 1.0),
+    vec3(0.2, 1.0, 0.2),
+    vec3(0.3, 0.5, 1.0)
 );
 
 /*

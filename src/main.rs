@@ -1,29 +1,23 @@
-//! Vulkan Application with the goal to render a triangle.
 #![allow(
     dead_code,
     unused_variables,
     unsafe_op_in_unsafe_fn,
+    clippy::manual_slice_size_calculation,
     clippy::too_many_arguments,
     clippy::unnecessary_wraps
 )]
 
-use std::{
-    collections::HashSet,
-    ffi::{c_void, CStr},
-};
+use std::{collections::HashSet, ffi::CStr, os::raw::c_void};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use log::*;
 use thiserror::Error;
 use vulkanalia::{
-    bytecode::Bytecode, loader::{LibloadingLoader, LIBRARY}, vk, vk::{
-        DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, Handle, HasBuilder, InstanceV1_0,
-        KhrSurfaceExtension, KhrSwapchainExtension, PhysicalDeviceType, SurfaceKHR,
-    },
+    bytecode::Bytecode,
+    loader::{LibloadingLoader, LIBRARY},
+    prelude::v1_0::*,
+    vk::{ExtDebugUtilsExtension, KhrSurfaceExtension, KhrSwapchainExtension},
     window as vk_window,
-    Device,
-    Entry,
-    Instance,
     Version,
 };
 use winit::{
@@ -33,90 +27,68 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-// ---------------------------------------------
-// Macros
-// ---------------------------------------------
-
-/// Include a `.spv` SPIR-V bytecode file from the build script's OUT_DIR at compile time.
+/// Include a `.spv` SPIR-V bytecode file from the build script's target directory at compile time.
 macro_rules! include_spirv {
     ($name:expr) => {
         include_bytes!(concat!(env!("SHADER_OUT_DIR"), "/", $name, ".spv"))
     };
 }
 
-// ---------------------------------------------
-// Global Constants
-// ---------------------------------------------
+/// Contains the vertex shader's compiled SPIR-V bytecode contents.
+const VERTEX_BYTECODE: &[u8] = include_spirv!("triangle.vert");
 
-/// Whether Vulkan validation layers should be enabled or not.
+/// Contains the fragment shader's compiled SPIR-V bytecode contents.
+const FRAGMENT_BYTECODE: &[u8] = include_spirv!("triangle.frag");
+
+/// Whether the validation layers should be enabled.
 const VALIDATION_ENABLED: bool = cfg!(debug_assertions);
 
-/// The Vulkan validation layer name as a safe CString.
+/// The name of the validation layers.
 const VALIDATION_LAYER: vk::ExtensionName =
-    vk::ExtensionName::from_bytes(c"VK_LAYER_KHRONOS_validation".to_bytes_with_nul());
+    vk::ExtensionName::from_bytes(b"VK_LAYER_KHRONOS_validation");
+
+/// The required device extensions.
+const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
 
 /// The Vulkan SDK version that started requiring the portability subset extension for macOS.
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 
-/// The Vulkan physical device level extensions. Here, we list the "VK_KHR_swapchain" extension,
-/// later useful for checking if the GPU has swap chain support.
-const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
+/// The maximum number of frames that can be processed concurrently.
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// Contains the vertex shader's compiled SPIR-V bytecode contents
-const VERTEX_BYTECODE: &[u8] = include_spirv!("triangle.vert");
-
-/// Contains the fragment shader's compiled SPIR-V bytecode contents
-const FRAGMENT_BYTECODE: &[u8] = include_spirv!("triangle.frag");
-
-// ---------------------------------------------
-// Entrypoint
-// ---------------------------------------------
-
+#[rustfmt::skip]
 fn main() -> Result<()> {
-    unsafe {
-        std::env::set_var("RUST_LOG", "trace");
-    }
     pretty_env_logger::init();
 
-    // Create the event loop.
-    let event_loop = EventLoop::new().context("Failed to create event loop.")?;
+    // Window
 
-    // Create the window.
+    let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new()
-        .with_title("Vulkan App")
-        .with_inner_size(LogicalSize::new(600, 400))
-        .with_active(false)
-        .build(&event_loop)
-        .context("Failed to create window.")?;
+        .with_title("Vulkan-RS")
+        .with_inner_size(LogicalSize::new(1000.0, 700.0))
+        .build(&event_loop)?;
 
-    // Create the Vulkan app
-    let mut app = unsafe { App::create(&window).context("Failed to create Vulkan App.")? };
+    // Borderless Fullscreen mode
+    // let primary_monitor = window.primary_monitor().expect("No primary monitor available");
+    // window.set_fullscreen(Some(Fullscreen::Borderless(Some(primary_monitor))));
 
-    // Run the event loop
+    // App
+
+    let mut app = unsafe { App::create(&window)? };
     event_loop.run(move |event, window_target| {
         match event {
-            // Request a redraw when all events have been processed (so we can render continuously
-            // even when there is no input from the OS)
+            // Request a redraw when all events were processed.
             Event::AboutToWait => window.request_redraw(),
-
-            // Check for window events (e.g. keyboard input, window close, etc.)
             Event::WindowEvent { event, .. } => match event {
-                // Render a frame if the App is not being destroyed.
-                WindowEvent::RedrawRequested if !window_target.exiting() => {
-                    unsafe { app.render(&window) }.unwrap();
-                }
-
-                // Destroy the App.
+                // Render a frame if our Vulkan app is not being destroyed.
+                WindowEvent::RedrawRequested if !window_target.exiting() => unsafe { app.render(&window) }.unwrap(),
+                // Destroy our Vulkan app.
                 WindowEvent::CloseRequested => {
                     window_target.exit();
-                    unsafe {
-                        app.destroy();
-                    }
+                    unsafe { app.destroy(); }
                 }
-
                 _ => {}
-            },
-
+            }
             _ => {}
         }
     })?;
@@ -124,430 +96,402 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------
-// Structs
-// ---------------------------------------------
+/// Our Vulkan app.
+#[derive(Clone, Debug)]
+struct App {
+    entry: Entry,
+    instance: Instance,
+    data: AppData,
+    device: Device,
+    frame: usize,
+}
 
-/// Intermediate Vulkan handles which get bundled into `App`.
+impl App {
+    /// Creates our Vulkan app.
+    unsafe fn create(window: &Window) -> Result<Self> {
+        let loader = LibloadingLoader::new(LIBRARY)?;
+        let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
+        let mut data = AppData::default();
+        let instance = create_instance(window, &entry, &mut data)?;
+        data.surface = vk_window::create_surface(&instance, &window, &window)?;
+        pick_physical_device(&instance, &mut data)?;
+        let device = create_logical_device(&entry, &instance, &mut data)?;
+        create_swapchain(window, &instance, &device, &mut data)?;
+        create_swapchain_image_views(&device, &mut data)?;
+        create_render_pass(&instance, &device, &mut data)?;
+        create_pipeline(&device, &mut data)?;
+        create_framebuffers(&device, &mut data)?;
+        create_command_pool(&instance, &device, &mut data)?;
+        create_command_buffers(&device, &mut data)?;
+        create_sync_objects(&device, &mut data)?;
+        Ok(Self {
+            entry,
+            instance,
+            data,
+            device,
+            frame: 0,
+        })
+    }
+
+    /// Renders a frame for our Vulkan app.
+    unsafe fn render(&mut self, window: &Window) -> Result<()> {
+        let in_flight_fence = self.data.in_flight_fences[self.frame];
+
+        self.device
+            .wait_for_fences(&[in_flight_fence], true, u64::MAX)?;
+
+        let image_index = self
+            .device
+            .acquire_next_image_khr(
+                self.data.swapchain,
+                u64::MAX,
+                self.data.image_available_semaphores[self.frame],
+                vk::Fence::null(),
+            )?
+            .0 as usize;
+
+        let image_in_flight = self.data.images_in_flight[image_index];
+        if !image_in_flight.is_null() {
+            self.device
+                .wait_for_fences(&[image_in_flight], true, u64::MAX)?;
+        }
+
+        self.data.images_in_flight[image_index] = in_flight_fence;
+
+        let wait_semaphores = &[self.data.image_available_semaphores[self.frame]];
+        let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let command_buffers = &[self.data.command_buffers[image_index]];
+        let signal_semaphores = &[self.data.render_finished_semaphores[self.frame]];
+        let submit_info = vk::SubmitInfo::builder()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(command_buffers)
+            .signal_semaphores(signal_semaphores);
+
+        self.device.reset_fences(&[in_flight_fence])?;
+
+        self.device
+            .queue_submit(self.data.graphics_queue, &[submit_info], in_flight_fence)?;
+
+        let swapchains = &[self.data.swapchain];
+        let image_indices = &[image_index as u32];
+        let present_info = vk::PresentInfoKHR::builder()
+            .wait_semaphores(signal_semaphores)
+            .swapchains(swapchains)
+            .image_indices(image_indices);
+
+        self.device
+            .queue_present_khr(self.data.present_queue, &present_info)?;
+
+        self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        Ok(())
+    }
+
+    /// Destroys our Vulkan app.
+    #[rustfmt::skip]
+    unsafe fn destroy(&mut self) {
+        self.device.device_wait_idle().unwrap();
+
+        self.data.in_flight_fences.iter().for_each(|f| self.device.destroy_fence(*f, None));
+        self.data.render_finished_semaphores.iter().for_each(|s| self.device.destroy_semaphore(*s, None));
+        self.data.image_available_semaphores.iter().for_each(|s| self.device.destroy_semaphore(*s, None));
+        self.device.destroy_command_pool(self.data.command_pool, None);
+        self.data.framebuffers.iter().for_each(|f| self.device.destroy_framebuffer(*f, None));
+        self.device.destroy_pipeline(self.data.pipeline, None);
+        self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
+        self.device.destroy_render_pass(self.data.render_pass, None);
+        self.data.swapchain_image_views.iter().for_each(|v| self.device.destroy_image_view(*v, None));
+        self.device.destroy_swapchain_khr(self.data.swapchain, None);
+        self.device.destroy_device(None);
+        self.instance.destroy_surface_khr(self.data.surface, None);
+
+        if VALIDATION_ENABLED {
+            self.instance.destroy_debug_utils_messenger_ext(self.data.messenger, None);
+        }
+
+        self.instance.destroy_instance(None);
+    }
+}
+
+/// The Vulkan handles and associated properties used by our Vulkan app.
 #[derive(Clone, Debug, Default)]
 struct AppData {
+    // Debug
     messenger: vk::DebugUtilsMessengerEXT,
-    surface: SurfaceKHR,
+    // Surface
+    surface: vk::SurfaceKHR,
+    // Physical Device / Logical Device
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    // Swapchain
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+    // Pipeline
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    // Framebuffers
     framebuffers: Vec<vk::Framebuffer>,
+    // Command Pool
     command_pool: vk::CommandPool,
+    // Command Buffers
     command_buffers: Vec<vk::CommandBuffer>,
+    // Sync Objects
+    image_available_semaphores: Vec<vk::Semaphore>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
+    in_flight_fences: Vec<vk::Fence>,
+    images_in_flight: Vec<vk::Fence>,
 }
 
-/// Main `App` which implements Vulkan boilerplate functionality.
-#[derive(Clone, Debug)]
-struct App {
-    entry: Entry,
-    instance: Instance,
-    device: Device,
-    data: AppData,
+//================================================
+// Instance
+//================================================
+
+unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) -> Result<Instance> {
+    // Application Info
+
+    let application_info = vk::ApplicationInfo::builder()
+        .application_name(b"Vulkan Tutorial (Rust)\0")
+        .application_version(vk::make_version(1, 0, 0))
+        .engine_name(b"No Engine\0")
+        .engine_version(vk::make_version(1, 0, 0))
+        .api_version(vk::make_version(1, 0, 0));
+
+    // Layers
+
+    let available_layers = entry
+        .enumerate_instance_layer_properties()?
+        .iter()
+        .map(|l| l.layer_name)
+        .collect::<HashSet<_>>();
+
+    if VALIDATION_ENABLED && !available_layers.contains(&VALIDATION_LAYER) {
+        return Err(anyhow!("Validation layer requested but not supported."));
+    }
+
+    let layers = if VALIDATION_ENABLED {
+        vec![VALIDATION_LAYER.as_ptr()]
+    } else {
+        Vec::new()
+    };
+
+    // Extensions
+
+    let mut extensions = vk_window::get_required_instance_extensions(window)
+        .iter()
+        .map(|e| e.as_ptr())
+        .collect::<Vec<_>>();
+
+    // Required by Vulkan SDK on macOS since 1.3.216.
+    let flags = if cfg!(target_os = "macos") && entry.version()? >= PORTABILITY_MACOS_VERSION {
+        info!("Enabling extensions for macOS portability.");
+        extensions.push(
+            vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_EXTENSION
+                .name
+                .as_ptr(),
+        );
+        extensions.push(vk::KHR_PORTABILITY_ENUMERATION_EXTENSION.name.as_ptr());
+        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+    } else {
+        vk::InstanceCreateFlags::empty()
+    };
+
+    if VALIDATION_ENABLED {
+        extensions.push(vk::EXT_DEBUG_UTILS_EXTENSION.name.as_ptr());
+    }
+
+    // Create
+
+    let mut info = vk::InstanceCreateInfo::builder()
+        .application_info(&application_info)
+        .enabled_layer_names(&layers)
+        .enabled_extension_names(&extensions)
+        .flags(flags);
+
+    let mut debug_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
+        .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::all())
+        .message_type(
+            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+        )
+        .user_callback(Some(debug_callback));
+
+    if VALIDATION_ENABLED {
+        info = info.push_next(&mut debug_info);
+    }
+
+    let instance = entry.create_instance(&info, None)?;
+
+    // Messenger
+
+    if VALIDATION_ENABLED {
+        data.messenger = instance.create_debug_utils_messenger_ext(&debug_info, None)?;
+    }
+
+    Ok(instance)
 }
 
-/// Obtains information about Vulkan swapchain availability.
-#[derive(Clone, Debug)]
-struct SwapchainSupport {
-    capabilities: vk::SurfaceCapabilitiesKHR,
-    formats: Vec<vk::SurfaceFormatKHR>,
-    present_modes: Vec<vk::PresentModeKHR>,
+extern "system" fn debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    type_: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _: *mut c_void,
+) -> vk::Bool32 {
+    let data = unsafe { *data };
+    let message = unsafe { CStr::from_ptr(data.message) }.to_string_lossy();
+
+    if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::ERROR {
+        error!("({type_:?}) {message}");
+    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING {
+        warn!("({type_:?}) {message}");
+    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::INFO {
+        debug!("({type_:?}) {message}");
+    } else {
+        trace!("({type_:?}) {message}");
+    }
+
+    vk::FALSE
 }
 
-/// A family queue contains different operations available on a physical device, (e.g. graphics,
-/// compute, transfer). These 'families' are identified by their index, starting from 0. The
-/// most important queue is the graphics queue, as this gives us the capability to render.
-#[derive(Copy, Clone, Debug)]
-struct QueueFamilyIndices {
-    graphics: u32,
-    present: u32,
-}
+//================================================
+// Physical Device
+//================================================
 
-/// Custom error handling for checking suitability of Vulkan components.
 #[derive(Debug, Error)]
-#[error("Missing {0}.")]
+#[error("{0}")]
 pub struct SuitabilityError(pub &'static str);
 
-// ---------------------------------------------
-// Vulkan Application
-// ---------------------------------------------
+unsafe fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> {
+    for physical_device in instance.enumerate_physical_devices()? {
+        let properties = instance.get_physical_device_properties(physical_device);
 
-impl App {
-    /// Initializes Vulkan resources tied to App.
-    unsafe fn create(window: &Window) -> Result<Self> {
-        let (entry, instance, data, device) = unsafe {
-            let loader = LibloadingLoader::new(LIBRARY)?;
-            let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
-            let mut data = AppData::default();
-            let instance = create_instance(window, &entry, &mut data)?;
-            data.surface = create_surface(&instance, &window)?;
-            pick_physical_device(&instance, &mut data)?;
-            let device = create_logical_device(&entry, &instance, &mut data)?;
-            create_swapchain(window, &instance, &device, &mut data)?;
-            create_swapchain_image_views(&device, &mut data)?;
-            create_render_pass(&instance, &device, &mut data)?;
-            create_pipeline(&device, &mut data)?;
-            create_framebuffers(&device, &mut data)?;
-            create_command_pool(&instance, &device, &mut data)?;
-            create_command_buffers(&device, &mut data)?;
-
-            (entry, instance, data, device)
-        };
-
-        Ok(Self {
-            entry,
-            instance,
-            device,
-            data,
-        })
-    }
-
-    /// Renders a frame for our Vulkan App.
-    unsafe fn render(&mut self, window: &Window) -> Result<()> {
-        Ok(())
-    }
-
-    /// Destroys Vulkan resources tied to App.
-    unsafe fn destroy(&mut self) {
-        unsafe {
-            self.device
-                .destroy_command_pool(self.data.command_pool, None);
-            trace!("Destroyed Vulkan command pool.");
-
-            self.data.framebuffers.iter().for_each(|f| {
-                self.device.destroy_framebuffer(*f, None);
-                // trace!("Destroyed Vulkan framebuffer.");
-            });
-
-            self.device.destroy_pipeline(self.data.pipeline, None);
-            trace!("Destroyed Vulkan pipeline object.");
-
-            self.device
-                .destroy_pipeline_layout(self.data.pipeline_layout, None);
-            trace!("Destroyed Vulkan pipeline layout.");
-
-            self.device.destroy_render_pass(self.data.render_pass, None);
-            trace!("Destroyed Vulkan render pass.");
-
-            self.data.swapchain_image_views.iter().for_each(|v| {
-                self.device.destroy_image_view(*v, None);
-                // trace!("Destroyed Vulkan swapchain image.");
-            });
-
-            self.device.destroy_swapchain_khr(self.data.swapchain, None);
-            trace!("Destroyed Vulkan swapchain.");
-
-            self.device.destroy_device(None);
-            trace!("Destroyed Vulkan logical device.");
-
-            self.instance.destroy_surface_khr(self.data.surface, None);
-            trace!("Destroyed Vulkan surface.");
-
-            if VALIDATION_ENABLED {
-                self.instance
-                    .destroy_debug_utils_messenger_ext(self.data.messenger, None);
-                trace!("Destroyed Vulkan debug messenger.")
-            }
-
-            self.instance.destroy_instance(None);
-            trace!("Destroyed Vulkan instance.")
+        if let Err(error) = check_physical_device(instance, data, physical_device) {
+            warn!(
+                "Skipping physical device (`{}`): {}",
+                properties.device_name, error
+            );
+        } else {
+            info!("Selected physical device (`{}`).", properties.device_name);
+            data.physical_device = physical_device;
+            return Ok(());
         }
     }
+
+    Err(anyhow!("Failed to find suitable physical device."))
 }
 
-// ---------------------------------------------
-// Command Buffers
-// ---------------------------------------------
+unsafe fn check_physical_device(
+    instance: &Instance,
+    data: &AppData,
+    physical_device: vk::PhysicalDevice,
+) -> Result<()> {
+    QueueFamilyIndices::get(instance, data, physical_device)?;
+    check_physical_device_extensions(instance, physical_device)?;
 
-unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<()> {
-    let allocate_info = vk::CommandBufferAllocateInfo::builder()
-        .command_pool(data.command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(data.framebuffers.len() as u32);
-
-    for (i, command_buffer) in data.command_buffers.iter().enumerate() {
-        let inheritance = vk::CommandBufferInheritanceInfo::builder();
-
-        let info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::empty())
-            .inheritance_info(&inheritance);
-
-        device.begin_command_buffer(*command_buffer, &info)?;
-
-        let render_area = vk::Rect2D::builder()
-            .offset(vk::Offset2D::default())
-            .extent(data.swapchain_extent);
-
-        let color_clear_value = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 0.0],
-            },
-        };
-
-        let clear_values = &[color_clear_value];
-        let info = vk::RenderPassBeginInfo::builder()
-            .render_pass(data.render_pass)
-            .framebuffer(data.framebuffers[i])
-            .render_area(render_area)
-            .clear_values(clear_values);
-
-        device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
-
-        device.cmd_bind_pipeline(
-            *command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            data.pipeline,
-        );
-
-        device.cmd_draw(*command_buffer, 3, 1, 0, 0);
-
-        device.cmd_end_render_pass(*command_buffer);
-        device.end_command_buffer(*command_buffer)?
+    let support = SwapchainSupport::get(instance, data, physical_device)?;
+    if support.formats.is_empty() || support.present_modes.is_empty() {
+        return Err(anyhow!(SuitabilityError("Insufficient swapchain support.")));
     }
 
     Ok(())
 }
 
-unsafe fn create_command_pool(
+unsafe fn check_physical_device_extensions(
     instance: &Instance,
-    device: &Device,
-    data: &mut AppData,
+    physical_device: vk::PhysicalDevice,
 ) -> Result<()> {
+    let extensions = instance
+        .enumerate_device_extension_properties(physical_device, None)?
+        .iter()
+        .map(|e| e.extension_name)
+        .collect::<HashSet<_>>();
+    if DEVICE_EXTENSIONS.iter().all(|e| extensions.contains(e)) {
+        Ok(())
+    } else {
+        Err(anyhow!(SuitabilityError(
+            "Missing required device extensions."
+        )))
+    }
+}
+
+//================================================
+// Logical Device
+//================================================
+
+unsafe fn create_logical_device(
+    entry: &Entry,
+    instance: &Instance,
+    data: &mut AppData,
+) -> Result<Device> {
+    // Queue Create Infos
+
     let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
 
-    let info = vk::CommandPoolCreateInfo::builder()
-        .flags(vk::CommandPoolCreateFlags::empty())
-        .queue_family_index(indices.graphics);
+    let mut unique_indices = HashSet::new();
+    unique_indices.insert(indices.graphics);
+    unique_indices.insert(indices.present);
 
-    data.command_pool = device.create_command_pool(&info, None)?;
-
-    Ok(())
-}
-
-// ---------------------------------------------
-// Framebuffers
-// ---------------------------------------------
-
-unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()> {
-    data.framebuffers = data
-        .swapchain_image_views
+    let queue_priorities = &[1.0];
+    let queue_infos = unique_indices
         .iter()
         .map(|i| {
-            let attachments = &[*i];
-            let info = vk::FramebufferCreateInfo::builder()
-                .render_pass(data.render_pass)
-                .attachments(attachments)
-                .width(data.swapchain_extent.width)
-                .height(data.swapchain_extent.height)
-                .layers(1);
-
-            device.create_framebuffer(&info, None)
+            vk::DeviceQueueCreateInfo::builder()
+                .queue_family_index(*i)
+                .queue_priorities(queue_priorities)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
 
-    Ok(())
-}
+    // Layers
 
-// ---------------------------------------------
-// Graphics Pipeline
-// ---------------------------------------------
+    let layers = if VALIDATION_ENABLED {
+        vec![VALIDATION_LAYER.as_ptr()]
+    } else {
+        vec![]
+    };
 
-unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
-    let vertex_shader_module = create_shader_module(device, VERTEX_BYTECODE)?;
-    let fragment_shader_module = create_shader_module(device, FRAGMENT_BYTECODE)?;
+    // Extensions
 
-    let vertex_stage = vk::PipelineShaderStageCreateInfo::builder()
-        .stage(vk::ShaderStageFlags::VERTEX)
-        .module(vertex_shader_module)
-        .name(b"main\0");
+    let mut extensions = DEVICE_EXTENSIONS
+        .iter()
+        .map(|n| n.as_ptr())
+        .collect::<Vec<_>>();
 
-    let fragment_stage = vk::PipelineShaderStageCreateInfo::builder()
-        .stage(vk::ShaderStageFlags::FRAGMENT)
-        .module(fragment_shader_module)
-        .name(b"main\0");
-
-    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
-
-    let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-        .primitive_restart_enable(false);
-
-    let viewport = vk::Viewport::builder()
-        .x(0.0)
-        .y(0.0)
-        .width(data.swapchain_extent.width as f32)
-        .height(data.swapchain_extent.height as f32)
-        .min_depth(0.0)
-        .max_depth(1.0);
-
-    let scissor = vk::Rect2D::builder()
-        .offset(vk::Offset2D { x: 0, y: 0 })
-        .extent(data.swapchain_extent);
-
-    let viewports = &[viewport];
-    let scissors = &[scissor];
-    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-        .viewports(viewports)
-        .scissors(scissors);
-
-    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
-        .depth_clamp_enable(false)
-        .rasterizer_discard_enable(false)
-        .polygon_mode(vk::PolygonMode::FILL)
-        .line_width(1.0)
-        .cull_mode(vk::CullModeFlags::BACK)
-        .front_face(vk::FrontFace::CLOCKWISE)
-        .depth_bias_enable(false);
-
-    let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
-        .sample_shading_enable(false)
-        .rasterization_samples(vk::SampleCountFlags::_1);
-
-    let attachment = vk::PipelineColorBlendAttachmentState::builder()
-        .color_write_mask(vk::ColorComponentFlags::all())
-        .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .alpha_blend_op(vk::BlendOp::ADD);
-
-    let attachments = &[attachment];
-    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
-        .logic_op_enable(false)
-        .logic_op(vk::LogicOp::COPY)
-        .attachments(attachments)
-        .blend_constants([0.0, 0.0, 0.0, 0.0]);
-
-    let layout_info = vk::PipelineLayoutCreateInfo::builder();
-    data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
-    trace!("Created Vulkan pipeline layout.");
-
-    let stages = &[vertex_stage, fragment_stage];
-    let info = vk::GraphicsPipelineCreateInfo::builder()
-        .stages(stages)
-        .vertex_input_state(&vertex_input_state)
-        .input_assembly_state(&input_assembly_state)
-        .viewport_state(&viewport_state)
-        .rasterization_state(&rasterization_state)
-        .multisample_state(&multisample_state)
-        .color_blend_state(&color_blend_state)
-        .layout(data.pipeline_layout)
-        .render_pass(data.render_pass)
-        .subpass(0);
-
-    data.pipeline = device
-        .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)?
-        .0[0];
-    trace!("Created Vulkan pipeline object.");
-
-    // Once the pipeline is created, SPIR-V bytecode is compiled into binary for execution by the
-    // GPU, at which point the shader modules have no purpose and should be immediately terminated.
-    // This is why shader modules are local to this function rather than fields in AppData.
-    device.destroy_shader_module(vertex_shader_module, None);
-    device.destroy_shader_module(fragment_shader_module, None);
-
-    Ok(())
-}
-
-/// A Vulkan shader module is a container for the SPIR-V bytecode to be explicitly validated and
-/// formatted internally by the implementation until it is linked to the Vulkan graphics pipeline.
-/// If the same shader module is used for multiple pipelines, caching will improve performance.
-
-/// Before creating the `Shader Module`, it is required to convert the shader bytecode from `u8` to
-/// `u32` because Vulkan expects it that way.
-unsafe fn create_shader_module(device: &Device, bytecode: &[u8]) -> Result<vk::ShaderModule> {
-    let bytecode = Bytecode::new(bytecode)?;
-
-    let info = vk::ShaderModuleCreateInfo::builder()
-        .code(bytecode.code())
-        .code_size(bytecode.code_size());
-
-    Ok(device.create_shader_module(&info, None)?)
-}
-
-unsafe fn create_render_pass(
-    instance: &Instance,
-    device: &Device,
-    data: &mut AppData,
-) -> Result<()> {
-    let color_attachment = vk::AttachmentDescription::builder()
-        .format(data.swapchain_format)
-        .samples(vk::SampleCountFlags::_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
-
-    let color_attachment_ref = vk::AttachmentReference::builder()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-
-    let color_attachments = &[color_attachment_ref];
-    let subpass = vk::SubpassDescription::builder()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(color_attachments);
-
-    let attachments = &[color_attachment];
-    let subpasses = &[subpass];
-    let info = vk::RenderPassCreateInfo::builder()
-        .attachments(attachments)
-        .subpasses(subpasses);
-
-    data.render_pass = device.create_render_pass(&info, None)?;
-    trace!("Created Vulkan render pass.");
-
-    Ok(())
-}
-
-// ---------------------------------------------
-// Swapchain
-// ---------------------------------------------
-
-/// In Vulkan, the `Swapchain` is essentially a queue of images waiting be presented to the screen.
-/// The conditions of how the queue works and how images are presented/synchronized can be
-/// configured explicitly, but the general purpose remains the same.
-///
-/// The swapchain works with the GPU obtaining an image from the queue, rendering
-/// to it, and returning it back to the queue to be presented. The swapchain uses synchronization to
-/// ensure that an image was fully rendered to before presenting to the screen.
-///
-/// Because Vulkan is platform and hardware agnostic, presentation is handled
-/// via an extension rather than a default framebuffer, which must be obtained. This extension is
-/// not guaranteed to be available, although most modern GPUs support swap chain functionality.
-
-impl SwapchainSupport {
-    /// Gets Vulkan swapchain capabilities, surface formats, and presentation modes.
-    unsafe fn get(
-        instance: &Instance,
-        data: &AppData,
-        physical_device: vk::PhysicalDevice,
-    ) -> Result<Self> {
-        Ok(Self {
-            capabilities: instance
-                .get_physical_device_surface_capabilities_khr(physical_device, data.surface)?,
-            formats: instance
-                .get_physical_device_surface_formats_khr(physical_device, data.surface)?,
-            present_modes: instance
-                .get_physical_device_surface_present_modes_khr(physical_device, data.surface)?,
-        })
+    // Required by Vulkan SDK on macOS since 1.3.216.
+    if cfg!(target_os = "macos") && entry.version()? >= PORTABILITY_MACOS_VERSION {
+        extensions.push(vk::KHR_PORTABILITY_SUBSET_EXTENSION.name.as_ptr());
     }
+
+    // Features
+
+    let features = vk::PhysicalDeviceFeatures::builder();
+
+    // Create
+
+    let info = vk::DeviceCreateInfo::builder()
+        .queue_create_infos(&queue_infos)
+        .enabled_layer_names(&layers)
+        .enabled_extension_names(&extensions)
+        .enabled_features(&features);
+
+    let device = instance.create_device(data.physical_device, &info, None)?;
+
+    // Queues
+
+    data.graphics_queue = device.get_device_queue(indices.graphics, 0);
+    data.present_queue = device.get_device_queue(indices.present, 0);
+
+    Ok(device)
 }
+
+//================================================
+// Swapchain
+//================================================
 
 unsafe fn create_swapchain(
     window: &Window,
@@ -555,6 +499,8 @@ unsafe fn create_swapchain(
     device: &Device,
     data: &mut AppData,
 ) -> Result<()> {
+    // Image
+
     let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
     let support = SwapchainSupport::get(instance, data, data.physical_device)?;
 
@@ -562,8 +508,10 @@ unsafe fn create_swapchain(
     let present_mode = get_swapchain_present_mode(&support.present_modes);
     let extent = get_swapchain_extent(window, support.capabilities);
 
+    data.swapchain_format = surface_format.format;
+    data.swapchain_extent = extent;
+
     let mut image_count = support.capabilities.min_image_count + 1;
-    // `0` here is a special value that means there is no maximum
     if support.capabilities.max_image_count != 0
         && image_count > support.capabilities.max_image_count
     {
@@ -578,6 +526,8 @@ unsafe fn create_swapchain(
     } else {
         vk::SharingMode::EXCLUSIVE
     };
+
+    // Create
 
     let info = vk::SwapchainCreateInfoKHR::builder()
         .surface(data.surface)
@@ -596,11 +546,10 @@ unsafe fn create_swapchain(
         .old_swapchain(vk::SwapchainKHR::null());
 
     data.swapchain = device.create_swapchain_khr(&info, None)?;
-    trace!("Created Vulkan swapchain.");
+
+    // Images
 
     data.swapchain_images = device.get_swapchain_images_khr(data.swapchain)?;
-    data.swapchain_format = surface_format.format;
-    data.swapchain_extent = extent;
 
     Ok(())
 }
@@ -624,6 +573,7 @@ fn get_swapchain_present_mode(present_modes: &[vk::PresentModeKHR]) -> vk::Prese
         .unwrap_or(vk::PresentModeKHR::FIFO)
 }
 
+#[rustfmt::skip]
 fn get_swapchain_extent(window: &Window, capabilities: vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
     if capabilities.current_extent.width != u32::MAX {
         capabilities.current_extent
@@ -673,143 +623,318 @@ unsafe fn create_swapchain_image_views(device: &Device, data: &mut AppData) -> R
     Ok(())
 }
 
-// ---------------------------------------------
-// Window Surface
-// ---------------------------------------------
+//================================================
+// Pipeline
+//================================================
 
-/// The Vulkan `Surface` is simply an *abstraction* of the native windowing or display target you
-/// want to present images to. It serves as the "glue" between Vulkan's generic presentation API
-/// and whatever the OS's underlying window-library actually provides.
-///
-/// Vulkan by itself doesn't know about windows or screens due to its platform-agnostic nature.
-/// It relies on `WSI` (window system integration) KHR extensions to tell it where to show
-/// rendered images to, which is essentially what the surface does.
+unsafe fn create_render_pass(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    // Attachments
 
-unsafe fn create_surface(instance: &Instance, window: &Window) -> Result<SurfaceKHR> {
-    let surface_raw = unsafe { vk_window::create_surface(instance, window, window) };
+    let color_attachment = vk::AttachmentDescription::builder()
+        .format(data.swapchain_format)
+        .samples(vk::SampleCountFlags::_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
 
-    let surface = surface_raw.map_err(|e| {
-        error!("Failed to create Vulkan KHR surface: {}", e);
-        e
-    })?;
+    // Subpasses
 
-    trace!("Created Vulkan KHR surface.");
+    let color_attachment_ref = vk::AttachmentReference::builder()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
-    Ok(surface)
+    let color_attachments = &[color_attachment_ref];
+    let subpass = vk::SubpassDescription::builder()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(color_attachments);
+
+    // Dependencies
+
+    let dependency = vk::SubpassDependency::builder()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+    // Create
+
+    let attachments = &[color_attachment];
+    let subpasses = &[subpass];
+    let dependencies = &[dependency];
+    let info = vk::RenderPassCreateInfo::builder()
+        .attachments(attachments)
+        .subpasses(subpasses)
+        .dependencies(dependencies);
+
+    data.render_pass = device.create_render_pass(&info, None)?;
+
+    Ok(())
 }
 
-// ---------------------------------------------
-// Logical Device
-// ---------------------------------------------
+unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
+    let vert_shader_module = create_shader_module(device, VERTEX_BYTECODE)?;
+    let frag_shader_module = create_shader_module(device, FRAGMENT_BYTECODE)?;
 
-/// The Vulkan physical device is just a description of the **GPU**. The Vulkan physical device
-/// never talks to the GPU directly. The `Logical Device` is simply a handle to that physical device
-/// to do all the *real* work. The logical device is a configured interface to the GPU and allows us
-/// to allocate memory or submit any work to Vulkan queues.
-///
-/// Multiple logical devices can be created from one physical device if we wanted different
-/// *contexts* with different enabled features or queue priorities. Also, multiple physical
-/// devices can be created if there are multiple GPUs detected, each with their own logical device
-/// for a multi-GPU setup.
+    let vert_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(vert_shader_module)
+        .name(b"main\0");
 
-unsafe fn create_logical_device(
-    entry: &Entry,
-    instance: &Instance,
-    data: &mut AppData,
-) -> Result<Device> {
-    let indices = unsafe { QueueFamilyIndices::get(instance, data, data.physical_device)? };
+    let frag_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::FRAGMENT)
+        .module(frag_shader_module)
+        .name(b"main\0");
 
-    let mut unique_indices = HashSet::new();
-    unique_indices.insert(indices.graphics);
-    unique_indices.insert(indices.present);
+    // Vertex Input State
 
-    // Set the queue priority to highest and provide the queue create info with the family index
-    // and priority float.
-    let queue_priorities = &[1.0];
+    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
 
-    // A single logical device can be created with multiple queues from different queue families,
-    // each with their own capabilities and priority. (in this case we only are using graphics
-    // queue)
-    let queue_infos = unique_indices
+    // Input Assembly State
+
+    let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(false);
+
+    // Viewport State
+
+    let viewport = vk::Viewport::builder()
+        .x(0.0)
+        .y(0.0)
+        .width(data.swapchain_extent.width as f32)
+        .height(data.swapchain_extent.height as f32)
+        .min_depth(0.0)
+        .max_depth(1.0);
+
+    let scissor = vk::Rect2D::builder()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(data.swapchain_extent);
+
+    let viewports = &[viewport];
+    let scissors = &[scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        .viewports(viewports)
+        .scissors(scissors);
+
+    // Rasterization State
+
+    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .line_width(1.0)
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_bias_enable(false);
+
+    // Multisample State
+
+    let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::_1);
+
+    // Color Blend State
+
+    let attachment = vk::PipelineColorBlendAttachmentState::builder()
+        .color_write_mask(vk::ColorComponentFlags::all())
+        .blend_enable(false);
+
+    let attachments = &[attachment];
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+        .logic_op_enable(false)
+        .logic_op(vk::LogicOp::COPY)
+        .attachments(attachments)
+        .blend_constants([0.0, 0.0, 0.0, 0.0]);
+
+    // Layout
+
+    let layout_info = vk::PipelineLayoutCreateInfo::builder();
+
+    data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
+
+    // Create
+
+    let stages = &[vert_stage, frag_stage];
+    let info = vk::GraphicsPipelineCreateInfo::builder()
+        .stages(stages)
+        .vertex_input_state(&vertex_input_state)
+        .input_assembly_state(&input_assembly_state)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization_state)
+        .multisample_state(&multisample_state)
+        .color_blend_state(&color_blend_state)
+        .layout(data.pipeline_layout)
+        .render_pass(data.render_pass)
+        .subpass(0);
+
+    data.pipeline = device
+        .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)?
+        .0[0];
+
+    // Cleanup
+
+    device.destroy_shader_module(vert_shader_module, None);
+    device.destroy_shader_module(frag_shader_module, None);
+
+    Ok(())
+}
+
+unsafe fn create_shader_module(device: &Device, bytecode: &[u8]) -> Result<vk::ShaderModule> {
+    let bytecode = Bytecode::new(bytecode)?;
+    let info = vk::ShaderModuleCreateInfo::builder()
+        .code(bytecode.code())
+        .code_size(bytecode.code_size());
+    Ok(device.create_shader_module(&info, None)?)
+}
+
+//================================================
+// Framebuffers
+//================================================
+
+unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()> {
+    data.framebuffers = data
+        .swapchain_image_views
         .iter()
         .map(|i| {
-            vk::DeviceQueueCreateInfo::builder()
-                .queue_family_index(*i)
-                .queue_priorities(queue_priorities)
+            let attachments = &[*i];
+            let create_info = vk::FramebufferCreateInfo::builder()
+                .render_pass(data.render_pass)
+                .attachments(attachments)
+                .width(data.swapchain_extent.width)
+                .height(data.swapchain_extent.height)
+                .layers(1);
+
+            device.create_framebuffer(&create_info, None)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Give the device level layer validation layer support (for compatibility of older
-    // vulkan implementations).
-    let layers = if VALIDATION_ENABLED {
-        vec![VALIDATION_LAYER.as_ptr()]
-    } else {
-        vec![]
-    };
-
-    // Device-level extension for the swapchain KHR functionality.
-    let mut extensions = DEVICE_EXTENSIONS
-        .iter()
-        .map(|n| n.as_ptr())
-        .collect::<Vec<_>>();
-
-    // Give the device level extensions portability support if the host is running macOS.
-    if cfg!(target_os = "macos") && entry.version()? >= PORTABILITY_MACOS_VERSION {
-        extensions.push(vk::KHR_PORTABILITY_SUBSET_EXTENSION.name.as_ptr());
-    }
-
-    // Get the physical device's supported features.
-    let features = vk::PhysicalDeviceFeatures::builder();
-
-    // Setup logical device create info with all queue info structs, layers, extensions, and
-    // features.
-    let device_info = vk::DeviceCreateInfo::builder()
-        .queue_create_infos(&queue_infos)
-        .enabled_layer_names(&layers)
-        .enabled_extension_names(&extensions)
-        .enabled_features(&features);
-
-    // Create the Vulkan logical device.
-
-    let device = unsafe {
-        match instance.create_device(data.physical_device, &device_info, None) {
-            Ok(device) => {
-                trace!("Created Vulkan logical device.");
-                device
-            }
-
-            Err(e) => {
-                error!("Failed to create Vulkan logical device.");
-                return Err(e.into());
-            }
-        }
-    };
-
-    // Set the graphics queue to the graphics family index.
-    data.graphics_queue = unsafe { device.get_device_queue(indices.graphics, 0) };
-    data.present_queue = unsafe { device.get_device_queue(indices.present, 0) };
-
-    Ok(device)
+    Ok(())
 }
 
-// ---------------------------------------------
-// Queue Families
-// ---------------------------------------------
+//================================================
+// Command Pool
+//================================================
+
+unsafe fn create_command_pool(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
+
+    let info = vk::CommandPoolCreateInfo::builder().queue_family_index(indices.graphics);
+
+    data.command_pool = device.create_command_pool(&info, None)?;
+
+    Ok(())
+}
+
+//================================================
+// Command Buffers
+//================================================
+
+unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<()> {
+    // Allocate
+
+    let allocate_info = vk::CommandBufferAllocateInfo::builder()
+        .command_pool(data.command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(data.framebuffers.len() as u32);
+
+    data.command_buffers = device.allocate_command_buffers(&allocate_info)?;
+
+    // Commands
+
+    for (i, command_buffer) in data.command_buffers.iter().enumerate() {
+        let info = vk::CommandBufferBeginInfo::builder();
+
+        device.begin_command_buffer(*command_buffer, &info)?;
+
+        let render_area = vk::Rect2D::builder()
+            .offset(vk::Offset2D::default())
+            .extent(data.swapchain_extent);
+
+        let color_clear_value = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+
+        let clear_values = &[color_clear_value];
+        let info = vk::RenderPassBeginInfo::builder()
+            .render_pass(data.render_pass)
+            .framebuffer(data.framebuffers[i])
+            .render_area(render_area)
+            .clear_values(clear_values);
+
+        device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
+        device.cmd_bind_pipeline(
+            *command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            data.pipeline,
+        );
+        device.cmd_draw(*command_buffer, 3, 1, 0, 0);
+        device.cmd_end_render_pass(*command_buffer);
+
+        device.end_command_buffer(*command_buffer)?;
+    }
+
+    Ok(())
+}
+
+//================================================
+// Sync Objects
+//================================================
+
+unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()> {
+    let semaphore_info = vk::SemaphoreCreateInfo::builder();
+    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+
+    for _ in 0..MAX_FRAMES_IN_FLIGHT {
+        data.image_available_semaphores
+            .push(device.create_semaphore(&semaphore_info, None)?);
+        data.render_finished_semaphores
+            .push(device.create_semaphore(&semaphore_info, None)?);
+
+        data.in_flight_fences
+            .push(device.create_fence(&fence_info, None)?);
+    }
+
+    data.images_in_flight = data
+        .swapchain_images
+        .iter()
+        .map(|_| vk::Fence::null())
+        .collect();
+
+    Ok(())
+}
+
+//================================================
+// Structs
+//================================================
+
+#[derive(Copy, Clone, Debug)]
+struct QueueFamilyIndices {
+    graphics: u32,
+    present: u32,
+}
 
 impl QueueFamilyIndices {
-    /// Get the index of the queue family which supports the "graphics" operation and
-    /// return it as an u32. If no family is found with graphics support, the function returns
-    /// with an error, otherwise the u32 index is returned (usually 0).
     unsafe fn get(
         instance: &Instance,
         data: &AppData,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Self> {
-        let properties =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let properties = instance.get_physical_device_queue_family_properties(physical_device);
 
-        // Iterate through the physical device queue family properties for the graphics queue flags.
-        // If the graphics flag exists, convert it to u32 (index).
         let graphics = properties
             .iter()
             .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
@@ -817,15 +942,11 @@ impl QueueFamilyIndices {
 
         let mut present = None;
         for (index, properties) in properties.iter().enumerate() {
-            let present_support = unsafe {
-                instance.get_physical_device_surface_support_khr(
-                    physical_device,
-                    index as u32,
-                    data.surface,
-                )?
-            };
-
-            if present_support {
+            if instance.get_physical_device_surface_support_khr(
+                physical_device,
+                index as u32,
+                data.surface,
+            )? {
                 present = Some(index as u32);
                 break;
             }
@@ -841,219 +962,26 @@ impl QueueFamilyIndices {
     }
 }
 
-// ---------------------------------------------
-// Physical Device
-// ---------------------------------------------
-
-/// Check whether the Vulkan physical device contains a geometry shader feature, and make
-/// sure the GPU is either integrated or discrete. If any of these are not detected, we return
-/// with an error.
-unsafe fn check_physical_device(
-    instance: &Instance,
-    data: &AppData,
-    physical_device: vk::PhysicalDevice,
-) -> Result<()> {
-    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
-    let features = unsafe { instance.get_physical_device_features(physical_device) };
-
-    if properties.device_type != PhysicalDeviceType::DISCRETE_GPU
-        && properties.device_type != PhysicalDeviceType::INTEGRATED_GPU
-    {
-        return Err(anyhow!(SuitabilityError(
-            "Only discrete and integrated GPUs are supported."
-        )));
-    } else if features.geometry_shader != vk::TRUE {
-        return Err(anyhow!(SuitabilityError(
-            "Missing geometry shader support."
-        )));
-    } else {
-        trace!("Found physical device: {}", properties.device_name);
-    }
-
-    unsafe { QueueFamilyIndices::get(instance, data, physical_device) }?;
-    unsafe { check_physical_device_extensions(instance, physical_device)? };
-
-    let support = SwapchainSupport::get(instance, data, physical_device)?;
-    if support.formats.is_empty() || support.present_modes.is_empty() {
-        return Err(anyhow!(SuitabilityError("Insufficient swapchain support.")));
-    }
-
-    Ok(())
+#[derive(Clone, Debug)]
+struct SwapchainSupport {
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    present_modes: Vec<vk::PresentModeKHR>,
 }
 
-/// Ensure the physical device supports the required swap chain extension.
-unsafe fn check_physical_device_extensions(
-    instance: &Instance,
-    physical_device: vk::PhysicalDevice,
-) -> Result<()> {
-    let extensions = instance
-        .enumerate_device_extension_properties(physical_device, None)?
-        .iter()
-        .map(|ext| ext.extension_name)
-        .collect::<HashSet<_>>();
-
-    if DEVICE_EXTENSIONS.iter().all(|e| extensions.contains(e)) {
-        Ok(())
-    } else {
-        Err(anyhow!(SuitabilityError(
-            "Missing required device extensions."
-        )))
+impl SwapchainSupport {
+    unsafe fn get(
+        instance: &Instance,
+        data: &AppData,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<Self> {
+        Ok(Self {
+            capabilities: instance
+                .get_physical_device_surface_capabilities_khr(physical_device, data.surface)?,
+            formats: instance
+                .get_physical_device_surface_formats_khr(physical_device, data.surface)?,
+            present_modes: instance
+                .get_physical_device_surface_present_modes_khr(physical_device, data.surface)?,
+        })
     }
-}
-
-/// Select a suitable Vulkan physical device (GPU) based on its properties and features.
-fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> {
-    for physical_device in unsafe { instance.enumerate_physical_devices()? } {
-        let properties = unsafe { instance.get_physical_device_properties(physical_device) };
-
-        match unsafe { check_physical_device(instance, data, physical_device) } {
-            Ok(_) => {
-                data.physical_device = physical_device;
-                return Ok(());
-            }
-            Err(_) => {
-                warn!("Skipping physical device (`{}`)", properties.device_name);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------
-// Debug Messenger
-// ---------------------------------------------
-
-/// Vulkan debug callback for explicit control over what the validation layers will print to
-/// standard output.
-extern "system" fn debug_callback(
-    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    type_: vk::DebugUtilsMessageTypeFlagsEXT,
-    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _: *mut c_void,
-) -> vk::Bool32 {
-    let data = unsafe { *data };
-    let message = unsafe { CStr::from_ptr(data.message).to_string_lossy() };
-
-    if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::ERROR {
-        error!("({:?}) {}", type_, message);
-    } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING {
-        warn!("({:?}) {}", type_, message);
-    }
-
-    vk::FALSE
-}
-
-// ---------------------------------------------
-// Instance
-// ---------------------------------------------
-
-/// Create the Vulkan instance.
-unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) -> Result<Instance> {
-    // Optional information to specify to the Vulkan driver.
-    let application_info = vk::ApplicationInfo::builder()
-        .application_name(c"Vulkan App".to_bytes_with_nul())
-        .application_version(vk::make_version(1, 0, 0))
-        .engine_name(c"No Engine".to_bytes_with_nul())
-        .engine_version(vk::make_version(1, 0, 0))
-        .api_version(vk::make_version(1, 0, 0));
-
-    // Retrieve the Vulkan available instance layers.
-    let available_layers = unsafe {
-        let available_layers = entry
-            .enumerate_instance_layer_properties()?
-            .iter()
-            .map(|l| l.layer_name)
-            .collect::<HashSet<_>>();
-
-        available_layers
-    };
-
-    if VALIDATION_ENABLED && !available_layers.contains(&VALIDATION_LAYER) {
-        return Err(anyhow!(
-            "Vulkan Validation layer \"{}\" requested, but not supported.",
-            VALIDATION_LAYER
-        ));
-    }
-
-    let layers = if VALIDATION_ENABLED {
-        vec![VALIDATION_LAYER.as_ptr()]
-    } else {
-        Vec::new()
-    };
-
-    // Retrieve required instance platform extensions.
-    let mut extensions = vk_window::get_required_instance_extensions(window)
-        .iter()
-        .map(|e| e.as_ptr())
-        .collect::<Vec<_>>();
-
-    if VALIDATION_ENABLED {
-        extensions.push(vk::EXT_DEBUG_UTILS_EXTENSION.name.as_ptr());
-    }
-
-    for &ext in &extensions {
-        let name = unsafe { CStr::from_ptr(ext) }.to_string_lossy();
-    }
-
-    // Required by Vulkan SDK on macOS since 1.3.216.
-    let flags = if cfg!(target_os = "macos") && entry.version()? >= PORTABILITY_MACOS_VERSION {
-        trace!("Enabling extensions for macOS portability.");
-        extensions.push(
-            vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_EXTENSION
-                .name
-                .as_ptr(),
-        );
-        extensions.push(vk::KHR_PORTABILITY_ENUMERATION_EXTENSION.name.as_ptr());
-        vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
-    } else {
-        vk::InstanceCreateFlags::empty()
-    };
-
-    // Populate the CreateInfo struct with the ApplicationInfo struct, and the enabled layers,
-    // extensions, and portability flags.
-    let mut create_info = vk::InstanceCreateInfo::builder()
-        .application_info(&application_info)
-        .enabled_layer_names(&layers)
-        .enabled_extension_names(&extensions)
-        .flags(flags);
-
-    // Populate DebugInfo struct with all severity flags, message types, and add
-    // `debug_callback()` to the struct.
-    let mut debug_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
-        .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::all())
-        .message_type(
-            vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-        )
-        .user_callback(Some(debug_callback));
-
-    // Add DebugInfo struct to CreateInfo struct as an extension so the debug messenger can validate
-    // instance creation and destruction.
-    if VALIDATION_ENABLED {
-        create_info = create_info.push_next(&mut debug_info)
-    }
-
-    // Create the Vulkan instance.
-    // let instance = unsafe { entry.create_instance(&create_info, None)? };
-    let instance = unsafe {
-        match entry.create_instance(&create_info, None) {
-            Ok(instance) => {
-                trace!("Created Vulkan instance.");
-                instance
-            }
-            Err(e) => {
-                error!("Failed to created Vulkan instance: {:?}", e);
-                return Err(e.into());
-            }
-        }
-    };
-
-    // Create the Vulkan debug messenger.
-    if VALIDATION_ENABLED {
-        data.messenger = unsafe { instance.create_debug_utils_messenger_ext(&debug_info, None)? };
-        trace!("Created Vulkan debug messenger.");
-    }
-
-    Ok(instance)
 }

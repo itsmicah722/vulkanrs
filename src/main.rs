@@ -144,6 +144,7 @@ struct AppData {
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    framebuffers: Vec<vk::Framebuffer>,
 }
 
 /// Main `App` which implements Vulkan boilerplate functionality.
@@ -196,6 +197,7 @@ impl App {
             create_swapchain_image_views(&device, &mut data)?;
             create_render_pass(&instance, &device, &mut data)?;
             create_pipeline(&device, &mut data)?;
+            create_framebuffers(&device, &mut data)?;
 
             (entry, instance, data, device)
         };
@@ -216,6 +218,11 @@ impl App {
     /// Destroys Vulkan resources tied to App.
     unsafe fn destroy(&mut self) {
         unsafe {
+            self.data.framebuffers.iter().for_each(|f| {
+                self.device.destroy_framebuffer(*f, None);
+                // trace!("Destroyed Vulkan framebuffer.");
+            });
+
             self.device.destroy_pipeline(self.data.pipeline, None);
             trace!("Destroyed Vulkan pipeline object.");
 
@@ -228,6 +235,7 @@ impl App {
 
             self.data.swapchain_image_views.iter().for_each(|v| {
                 self.device.destroy_image_view(*v, None);
+                // trace!("Destroyed Vulkan swapchain image.");
             });
 
             self.device.destroy_swapchain_khr(self.data.swapchain, None);
@@ -249,6 +257,30 @@ impl App {
             trace!("Destroyed Vulkan instance.")
         }
     }
+}
+
+// ---------------------------------------------
+// Framebuffers
+// ---------------------------------------------
+
+unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()> {
+    data.framebuffers = data
+        .swapchain_image_views
+        .iter()
+        .map(|i| {
+            let attachments = &[*i];
+            let info = vk::FramebufferCreateInfo::builder()
+                .render_pass(data.render_pass)
+                .attachments(attachments)
+                .width(data.swapchain_extent.width)
+                .height(data.swapchain_extent.height)
+                .layers(1);
+
+            device.create_framebuffer(&info, None)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(())
 }
 
 // ---------------------------------------------
@@ -401,7 +433,7 @@ unsafe fn create_render_pass(
         .subpasses(subpasses);
 
     data.render_pass = device.create_render_pass(&info, None)?;
-    trace!("Created the Vulkan render pass.");
+    trace!("Created Vulkan render pass.");
 
     Ok(())
 }
@@ -575,6 +607,7 @@ unsafe fn create_swapchain_image_views(device: &Device, data: &mut AppData) -> R
 /// Vulkan by itself doesn't know about windows or screens due to its platform-agnostic nature.
 /// It relies on `WSI` (window system integration) KHR extensions to tell it where to show
 /// rendered images to, which is essentially what the surface does.
+
 unsafe fn create_surface(instance: &Instance, window: &Window) -> Result<SurfaceKHR> {
     let surface_raw = unsafe { vk_window::create_surface(instance, window, window) };
 
@@ -601,6 +634,7 @@ unsafe fn create_surface(instance: &Instance, window: &Window) -> Result<Surface
 /// *contexts* with different enabled features or queue priorities. Also, multiple physical
 /// devices can be created if there are multiple GPUs detected, each with their own logical device
 /// for a multi-GPU setup.
+
 unsafe fn create_logical_device(
     entry: &Entry,
     instance: &Instance,

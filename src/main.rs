@@ -9,21 +9,22 @@
 
 use std::{
     collections::HashSet,
-    ffi::{c_void, CStr},
+    ffi::{CStr, c_void},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::*;
 use thiserror::Error;
 use vulkanalia::{
-    loader::{LibloadingLoader, LIBRARY}, vk, vk::{
+    Device, Entry, Instance, Version,
+    bytecode::Bytecode,
+    loader::{LIBRARY, LibloadingLoader},
+    vk,
+    vk::{
         DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, Handle, HasBuilder, InstanceV1_0,
         KhrSurfaceExtension, KhrSwapchainExtension, PhysicalDeviceType, SurfaceKHR,
-    }, window as vk_window,
-    Device,
-    Entry,
-    Instance,
-    Version,
+    },
+    window as vk_window,
 };
 use winit::{
     dpi::LogicalSize,
@@ -31,6 +32,17 @@ use winit::{
     event_loop::EventLoop,
     window::{Window, WindowBuilder},
 };
+
+// ---------------------------------------------
+// Macros
+// ---------------------------------------------
+
+/// Include a `.spv` SPIR-V bytecode file from the build script's OUT_DIR at compile time.
+macro_rules! include_spirv {
+    ($name:expr) => {
+        include_bytes!(concat!(env!("SHADER_OUT_DIR"), "/", $name, ".spv"))
+    };
+}
 
 // ---------------------------------------------
 // Global Constants
@@ -49,6 +61,12 @@ const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 /// The Vulkan physical device level extensions. Here, we list the "VK_KHR_swapchain" extension,
 /// later useful for checking if the GPU has swap chain support.
 const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
+
+/// Contains the vertex shader's compiled SPIR-V bytecode contents
+const VERTEX_BYTECODE: &[u8] = include_spirv!("triangle.vert");
+
+/// Contains the fragment shader's compiled SPIR-V bytecode contents
+const FRAGMENT_BYTECODE: &[u8] = include_spirv!("triangle.frag");
 
 // ---------------------------------------------
 // Entrypoint
@@ -123,6 +141,8 @@ struct AppData {
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+    render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
 }
 
 /// Main `App` which implements Vulkan boilerplate functionality.
@@ -173,6 +193,8 @@ impl App {
             let device = create_logical_device(&entry, &instance, &mut data)?;
             create_swapchain(window, &instance, &device, &mut data)?;
             create_swapchain_image_views(&device, &mut data)?;
+            create_render_pass(&instance, &device, &mut data)?;
+            create_pipeline(&device, &mut data)?;
 
             (entry, instance, data, device)
         };
@@ -193,6 +215,13 @@ impl App {
     /// Destroys Vulkan resources tied to App.
     unsafe fn destroy(&mut self) {
         unsafe {
+            self.device
+                .destroy_pipeline_layout(self.data.pipeline_layout, None);
+            trace!("Destroyed Vulkan pipeline layout.");
+
+            self.device.destroy_render_pass(self.data.render_pass, None);
+            trace!("Destroyed Vulkan render pass.");
+
             self.data.swapchain_image_views.iter().for_each(|v| {
                 self.device.destroy_image_view(*v, None);
             });
@@ -216,6 +245,143 @@ impl App {
             trace!("Destroyed Vulkan instance.")
         }
     }
+}
+
+// ---------------------------------------------
+// Graphics Pipeline
+// ---------------------------------------------
+
+unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
+    let vertex_shader_module = create_shader_module(device, VERTEX_BYTECODE)?;
+    let fragment_shader_module = create_shader_module(device, FRAGMENT_BYTECODE)?;
+
+    let vertex_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(vertex_shader_module)
+        .name(b"main\0");
+
+    let fragment_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::FRAGMENT)
+        .module(fragment_shader_module)
+        .name(b"main\0");
+
+    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
+
+    let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(false);
+
+    let viewport = vk::Viewport::builder()
+        .x(0.0)
+        .y(0.0)
+        .width(data.swapchain_extent.width as f32)
+        .height(data.swapchain_extent.height as f32)
+        .min_depth(0.0)
+        .max_depth(1.0);
+
+    let scissor = vk::Rect2D::builder()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(data.swapchain_extent);
+
+    let viewports = &[viewport];
+    let scissors = &[scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        .viewports(viewports)
+        .scissors(scissors);
+
+    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .line_width(1.0)
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_bias_enable(false);
+
+    let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::_1);
+
+    let attachment = vk::PipelineColorBlendAttachmentState::builder()
+        .color_write_mask(vk::ColorComponentFlags::all())
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .alpha_blend_op(vk::BlendOp::ADD);
+
+    let attachments = &[attachment];
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+        .logic_op_enable(false)
+        .logic_op(vk::LogicOp::COPY)
+        .attachments(attachments)
+        .blend_constants([0.0, 0.0, 0.0, 0.0]);
+
+    let layout_info = vk::PipelineLayoutCreateInfo::builder();
+    data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
+    trace!("Created Vulkan pipeline layout.");
+
+    // Once the pipeline is created, SPIR-V bytecode is compiled into binary for execution by the
+    // GPU, at which point the shader modules have no purpose and should be immediately terminated.
+    // This is why shader modules are local to this function rather than fields in AppData.
+    device.destroy_shader_module(vertex_shader_module, None);
+    device.destroy_shader_module(fragment_shader_module, None);
+
+    Ok(())
+}
+
+/// A Vulkan shader module is a container for the SPIR-V bytecode to be explicitly validated and
+/// formatted internally by the implementation until it is linked to the Vulkan graphics pipeline.
+/// If the same shader module is used for multiple pipelines, caching will improve performance.
+
+/// Before creating the `Shader Module`, it is required to convert the shader bytecode from `u8` to
+/// `u32` because Vulkan expects it that way.
+unsafe fn create_shader_module(device: &Device, bytecode: &[u8]) -> Result<vk::ShaderModule> {
+    let bytecode = Bytecode::new(bytecode)?;
+
+    let info = vk::ShaderModuleCreateInfo::builder()
+        .code(bytecode.code())
+        .code_size(bytecode.code_size());
+
+    Ok(device.create_shader_module(&info, None)?)
+}
+
+unsafe fn create_render_pass(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    let color_attachment = vk::AttachmentDescription::builder()
+        .format(data.swapchain_format)
+        .samples(vk::SampleCountFlags::_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+
+    let color_attachment_ref = vk::AttachmentReference::builder()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+    let color_attachments = &[color_attachment_ref];
+    let subpass = vk::SubpassDescription::builder()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(color_attachments);
+
+    let attachments = &[color_attachment];
+    let subpasses = &[subpass];
+    let info = vk::RenderPassCreateInfo::builder()
+        .attachments(attachments)
+        .subpasses(subpasses);
+
+    data.render_pass = device.create_render_pass(&info, None)?;
+    trace!("Created the Vulkan render pass.");
+
+    Ok(())
 }
 
 // ---------------------------------------------

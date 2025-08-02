@@ -9,22 +9,22 @@
 
 use std::{
     collections::HashSet,
-    ffi::{CStr, c_void},
+    ffi::{c_void, CStr},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use log::*;
 use thiserror::Error;
 use vulkanalia::{
-    Device, Entry, Instance, Version,
-    bytecode::Bytecode,
-    loader::{LIBRARY, LibloadingLoader},
-    vk,
-    vk::{
+    bytecode::Bytecode, loader::{LibloadingLoader, LIBRARY}, vk, vk::{
         DeviceV1_0, EntryV1_0, ExtDebugUtilsExtension, Handle, HasBuilder, InstanceV1_0,
         KhrSurfaceExtension, KhrSwapchainExtension, PhysicalDeviceType, SurfaceKHR,
     },
     window as vk_window,
+    Device,
+    Entry,
+    Instance,
+    Version,
 };
 use winit::{
     dpi::LogicalSize,
@@ -143,6 +143,7 @@ struct AppData {
     swapchain_image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
 }
 
 /// Main `App` which implements Vulkan boilerplate functionality.
@@ -215,6 +216,9 @@ impl App {
     /// Destroys Vulkan resources tied to App.
     unsafe fn destroy(&mut self) {
         unsafe {
+            self.device.destroy_pipeline(self.data.pipeline, None);
+            trace!("Destroyed Vulkan pipeline object.");
+
             self.device
                 .destroy_pipeline_layout(self.data.pipeline_layout, None);
             trace!("Destroyed Vulkan pipeline layout.");
@@ -322,6 +326,24 @@ unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
     let layout_info = vk::PipelineLayoutCreateInfo::builder();
     data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
     trace!("Created Vulkan pipeline layout.");
+
+    let stages = &[vertex_stage, fragment_stage];
+    let info = vk::GraphicsPipelineCreateInfo::builder()
+        .stages(stages)
+        .vertex_input_state(&vertex_input_state)
+        .input_assembly_state(&input_assembly_state)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization_state)
+        .multisample_state(&multisample_state)
+        .color_blend_state(&color_blend_state)
+        .layout(data.pipeline_layout)
+        .render_pass(data.render_pass)
+        .subpass(0);
+
+    data.pipeline = device
+        .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)?
+        .0[0];
+    trace!("Created Vulkan pipeline object.");
 
     // Once the pipeline is created, SPIR-V bytecode is compiled into binary for execution by the
     // GPU, at which point the shader modules have no purpose and should be immediately terminated.

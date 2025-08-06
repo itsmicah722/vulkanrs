@@ -7,6 +7,7 @@
 //! This application follows this [tutorial](https://kylemayes.github.io/vulkanalia/) for getting
 //! the Vulkan boilerplate working in Rust.
 
+mod vulkan;
 mod window;
 
 use window::Window;

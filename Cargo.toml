@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-winit = "0.30.12"
-vulkanalia = "0.29.0"
+winit = {version = "0.30.12", features = ["rwh_06"]}
+raw-window-handle = "0.6.2"
+thiserror = "2.0.12"
 
 [build-dependencies]
 shaderc = "0.9.1"

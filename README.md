@@ -11,6 +11,11 @@ development project for my own engine, using what I learn overtime. The more I l
 more than likely won't become a fully-featured "game engine" but I certainly (eventually) want to the least make a 3D
 renderer capable of ray-tracing, post-processing effects, animation, GUI, shadow maps, etc.
 
+### Note
+
+Currently, the [old main.rs](reference/main.rs) is being refactored into different rust modules for better structure.
+The old file was simply too large to navigate, plus I would like to add some new functionality while I'm at it. 
+
 ## Credit
 
 I used the [Vulkanalia Tutorial](https://kylemayes.github.io/vulkanalia/introduction.html) to learn the basics of

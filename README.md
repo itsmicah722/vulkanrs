@@ -7,9 +7,9 @@ would be more than enough for my tiny little engine, but Vulkan is the modern re
 documentation and learning resources just like OpenGL, so why not?
 
 I am currently following a guide to learn, though I plan to eventually use this repository as a long-term
-development project for my own engine, using what I learn overtime. The more I learn Vulkan the more I realize this 
-more than likely won't become a fully-featured "game engine" but I certainly want to the least make a 3D renderer 
-capable of ray-tracing, post-processing effects, animation, GUI, shadow maps, etc.
+development project for my own engine, using what I learn overtime. The more I learn Vulkan the more I realize this
+more than likely won't become a fully-featured "game engine" but I certainly (eventually) want to the least make a 3D
+renderer capable of ray-tracing, post-processing effects, animation, GUI, shadow maps, etc.
 
 ## Credit
 
